@@ -1,0 +1,35 @@
+# 개인 키 및 보안 파일
+id_github
+id_github.pub
+
+# Python 관련 가상환경 및 캐시
+__pycache__/
+*.py[cod]
+*.class
+.venv/
+venv/
+ENV/
+
+# 데이터베이스 및 대용량 벡터 데이터
+music_vector_db/
+vector_db/
+app/music_vector_db/
+app/vector_db/
+*.sqlite3
+
+# 로그 파일 및 백업
+*.log
+*.bak
+
+# OS 설정 파일
+.DS_Store
+Thumbs.db
+.env
+
+#임시 파일
+.aider/
+.cache/
+.local/
+.cache/
+.aider.chat.history.md
+.aider.input.history

@@ -1,0 +1,31 @@
+services:
+  music-ai-agent:
+    image: python:3.11-slim
+    container_name: music_ai_agent
+    tty: true
+    volumes:
+      - /mnt/ExtSSD/MP3:/music:ro
+      - ./app:/app
+      - ./music_vector_db:/app/vector_db
+      - ./.env:/app/.env  # 호스트의 .env를 컨테이너의 /app/.env로 연결
+    working_dir: /app
+    # 컨테이너 시작 시 라이브러리 설치 후 실행
+    command: sh -c "pip install --no-cache-dir -r requirements.txt && python main.py"
+    
+    # 1. 환경 변수 파일 연결 (파일에서 읽어오기)
+    env_file:
+      - .env
+      
+    # 2. 개별 환경 변수 설정
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - MUSIC_CHANNEL_ID=${MUSIC_CHANNEL_ID}
+
+    networks:
+      - aider_jupyter_default
+    restart: always
+
+networks:
+  aider_jupyter_default:
+    external: true
