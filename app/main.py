@@ -9,6 +9,9 @@ music_bot.py — Telegram Music Bot (개선판)
   - print() → logging 모듈로 통일
   - Telegram caption 길이 2048 자 제한 대응
   - 검색 재시도(fallback) 단계별 로그 추가
+  - SQLite DB 추가 (사용자 접근 제어, 메시지 TTL 관리)
+  - LRU 사용자 관리 (최대 10 명)
+  - 7 일 TTL 메시지 자동 삭제
 """
 
 import os
@@ -17,7 +20,9 @@ import asyncio
 import re
 import sys
 import random
+import time
 import logging
+import aiosqlite
 
 import ollama
 import chromadb
@@ -45,24 +50,21 @@ EMBED_MODEL  = "mxbai-embed-large"
 MAX_RESULTS  = 10   # 최대 검색 결과 수
 CAPTION_LIMIT = 1024  # Telegram caption 최대 길이 (여유 있게 제한)
 
+BOT_DB_PATH = "./bot_data.db"
+MAX_USERS = 10
+TTL_SECONDS = 7 * 24 * 60 * 60  # 7 days in seconds
+
 OLLAMA_HOST      = os.getenv("OLLAMA_HOST", "http://ollama:11434")
-MUSIC_CHANNEL_ID = os.getenv("MUSIC_CHANNEL_ID")
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
 
 # 필수 환경 변수 검증
 _missing = [name for name, val in [
-    ("MUSIC_CHANNEL_ID", MUSIC_CHANNEL_ID),
     ("TELEGRAM_TOKEN",   TELEGRAM_TOKEN),
 ] if not val]
 
 if _missing:
     logger.critical("❌ 필수 환경 변수 미설정: %s", ", ".join(_missing))
     sys.exit(1)
-
-try:
-    MUSIC_CHANNEL_ID = int(MUSIC_CHANNEL_ID)
-except ValueError:
-    pass  # 문자열 채널 ID 도 허용 (예: @channelname)
 
 # ══════════════════════════════════════════════════════════════════
 #  🗄️  DB 연결
@@ -73,6 +75,75 @@ collection = _chroma.get_or_create_collection(name="music_library")
 # ══════════════════════════════════════════════════════════════════
 #  🛠️  유틸리티
 # ══════════════════════════════════════════════════════════════════
+async def init_db():
+    async with aiosqlite.connect(BOT_DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                chat_id INTEGER PRIMARY KEY,
+                last_active REAL
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS sent_messages (
+                rowid INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER,
+                message_id INTEGER,
+                sent_at REAL
+            )
+        """)
+        await db.commit()
+
+async def update_user_access(chat_id: int):
+    async with aiosqlite.connect(BOT_DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO users (chat_id, last_active) VALUES (?, ?)",
+            (chat_id, time.time())
+        )
+        
+        count_cursor = await db.execute("SELECT COUNT(*) FROM users")
+        row = await count_cursor.fetchone()
+        count = row[0] if row else 0
+       
+        if count > MAX_USERS:
+            cursor = await db.execute(
+                "SELECT chat_id FROM users ORDER BY last_active ASC LIMIT 1 OFFSET ?",
+                (MAX_USERS,) # Skips the 10 newest, gets the 11th (oldest)
+            )
+            oldest_row = await cursor.fetchone()
+            if oldest_row:
+                oldest_id = oldest_row[0]
+                await db.execute("DELETE FROM users WHERE chat_id = ?", (oldest_id,))
+                await db.execute("DELETE FROM sent_messages WHERE chat_id = ?", (oldest_id,))
+                
+        await db.commit()
+
+async def ttl_cleanup_task(application):
+    await asyncio.sleep(10)  # Small delay to ensure bot is fully started
+    while True:
+        try:
+            cutoff_time = time.time() - TTL_SECONDS
+            async with aiosqlite.connect(BOT_DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(
+                    "SELECT rowid, chat_id, message_id FROM sent_messages WHERE sent_at < ?",
+                    (cutoff_time,)
+                )
+                rows = await cursor.fetchall()
+                
+                for row in rows:
+                    try:
+                        await application.bot.delete_message(row["chat_id"], row["message_id"])
+                    except TelegramError as e:
+                        logger.warning("TTL 삭제 실패 (봇 차단 또는 메시지 없음): %s", e)
+                    
+                    await db.execute("DELETE FROM sent_messages WHERE rowid = ?", (row["rowid"],))
+                
+                await db.commit()
+        except Exception as e:
+            logger.error("TTL 정리 루프 에러: %s", e)
+            
+        await asyncio.sleep(3600)  # Run every 1 hour
+
 async def safe_edit(message, text: str) -> None:
     """status 메시지 편집 실패 시 예외를 무시하고 로그만 남긴다."""
     try:
@@ -256,12 +327,13 @@ async def search_music(intent: dict) -> tuple[list[str], list[dict]]:
 # ══════════════════════════════════════════════════════════════════
 async def send_music_files(
     context: ContextTypes.DEFAULT_TYPE,
+    target_chat_id: int,
     update: Update,
     file_paths: list[str],
     metadatas: list[dict],
     user_query: str,
 ) -> int:
-    """음악 파일을 MUSIC_CHANNEL_ID 채널로 전송하고 성공 건수를 반환한다."""
+    """음악 파일을 target_chat_id 로 전송하고 성공 건수를 반환한다."""
     success = 0
     errors  = []
     total   = len(file_paths)
@@ -282,12 +354,18 @@ async def send_music_files(
 
         try:
             with open(path, "rb") as audio:
-                await context.bot.send_audio(
-                    chat_id=MUSIC_CHANNEL_ID,
+                msg = await context.bot.send_audio(
+                    chat_id=target_chat_id,
                     audio=audio,
                     caption=caption,
                 )
             success += 1
+            async with aiosqlite.connect(BOT_DB_PATH) as db:
+                await db.execute(
+                    "INSERT INTO sent_messages (chat_id, message_id, sent_at) VALUES (?, ?, ?)",
+                    (target_chat_id, msg.message_id, time.time())
+                )
+                await db.commit()
             logger.info("[%d/%d] 전송 완료: %s", i, total, display)
             await asyncio.sleep(1.0)
         except TelegramError as e:
@@ -322,6 +400,9 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(f"DB: {collection.count()}곡")
         return
 
+    # 사용자 접근 제어 업데이트
+    await update_user_access(chat_id)
+
     status_msg = await update.message.reply_text("🤔 요청 분석 및 검색 중. ..")
 
     try:
@@ -339,7 +420,7 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await safe_edit(status_msg, f"🎧 {len(file_paths)}곡을 찾았습니다. 전송을 시작합니다!")
 
         # 3 단계: 파일 전송
-        success = await send_music_files(context, update, file_paths, metadatas, user_query)
+        success = await send_music_files(context, chat_id, update, file_paths, metadatas, user_query)
         await update.message.reply_text(f"✅ 전송 완료: {success}/{len(file_paths)}곡")
 
     except Exception as e:
@@ -349,8 +430,12 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ══════════════════════════════════════════════════════════════════
 #  🚀  진입점
 # ══════════════════════════════════════════════════════════════════
+async def post_init(application):
+    await init_db()
+    asyncio.create_task(ttl_cleanup_task(application))
+
 if __name__ == "__main__":
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_query))
-    logger.info("🤖 봇 가동 중... (DB: %d곡)", collection.count())
+    logger.info("🤖 봇 가동 중...")
     app.run_polling()

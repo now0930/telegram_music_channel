@@ -3,3 +3,4 @@ ollama
 chromadb
 mutagen
 librosa
+aiosqlite
