@@ -100,21 +100,18 @@ async def update_user_access(chat_id: int):
             (chat_id, time.time())
         )
         
-        count_cursor = await db.execute("SELECT COUNT(*) FROM users")
-        row = await count_cursor.fetchone()
-        count = row[0] if row else 0
-       
-        if count > MAX_USERS:
-            cursor = await db.execute(
-                "SELECT chat_id FROM users ORDER BY last_active ASC LIMIT 1 OFFSET ?",
-                (MAX_USERS,) # Skips the 10 newest, gets the 11th (oldest)
-            )
-            oldest_row = await cursor.fetchone()
-            if oldest_row:
-                oldest_id = oldest_row[0]
-                await db.execute("DELETE FROM users WHERE chat_id = ?", (oldest_id,))
-                await db.execute("DELETE FROM sent_messages WHERE chat_id = ?", (oldest_id,))
-                
+        # 견고한 방식: 최신 유저 MAX_USERS명을 제외한 나머지(오래된 유저)를 모두 찾아 삭제
+        cursor = await db.execute(
+            "SELECT chat_id FROM users WHERE chat_id NOT IN (SELECT chat_id FROM users ORDER BY last_active DESC LIMIT ?)",
+            (MAX_USERS,)
+        )
+        evicted_users = await cursor.fetchall()
+        
+        for row in evicted_users:
+            evicted_id = row[0]
+            await db.execute("DELETE FROM sent_messages WHERE chat_id = ?", (evicted_id,))
+            await db.execute("DELETE FROM users WHERE chat_id = ?", (evicted_id,))
+            
         await db.commit()
 
 async def ttl_cleanup_task(application):
