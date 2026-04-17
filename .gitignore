@@ -33,3 +33,8 @@ Thumbs.db
 .cache/
 .aider.chat.history.md
 .aider.input.history
+
+
+# SQLite 데이터베이스 파일 제외
+*.db
+bot_data.db
