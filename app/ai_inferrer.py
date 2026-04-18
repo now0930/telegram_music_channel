@@ -165,7 +165,7 @@ def search_track_info(artist: str, title: str) -> dict:
     
     # ManiaDB 시도
     try:
-        maniadb_data = fetch_maniadb(artist, title) # metadata_fixer의 함수명에 맞게 수정
+        maniadb_data = fetch_maniadb(artist, title) # metadata_fixer 의 함수명에 맞게 수정
         if maniadb_data:
             if not result.get('year') and maniadb_data.get('year'): result['year'] = maniadb_data['year']
             if not result.get('genre') and maniadb_data.get('genre'): result['genre'] = maniadb_data['genre']
@@ -177,7 +177,7 @@ def search_track_info(artist: str, title: str) -> dict:
         
     # MusicBrainz 시도
     try:
-        mb_data = fetch_musicbrainz(artist, title) # metadata_fixer의 함수명에 맞게 수정
+        mb_data = fetch_musicbrainz(artist, title) # metadata_fixer 의 함수명에 맞게 수정
         if mb_data:
             if not result.get('year') and mb_data.get('year'): result['year'] = mb_data['year']
             if not result.get('genre') and mb_data.get('genre'): result['genre'] = mb_data['genre']
@@ -217,7 +217,7 @@ JSON 출력:"""
     return prompt
 
 def query_ollama(prompt: str) -> Optional[list[dict]]:
-    """Ollama API를 호출하여 JSON 형태의 추론 결과 반환"""
+    """Ollama API 를 호출하여 JSON 형태의 추론 결과 반환"""
     payload = {
         "model": OLLAMA_MODEL,
         "prompt": prompt,
@@ -234,19 +234,16 @@ def query_ollama(prompt: str) -> Optional[list[dict]]:
             # Ollama 응답 파싱
             raw_response = response.json().get("response", "")
             
-            # JSON 문자열 파싱 (마크다운 코드블럭 ```json ... ``` 제거 로직 포함)
-            # gemma 모델 등에서 마크다운을 포함할 수 있으므로 정규식으로 추출
+            # JSON 문자열 파싱 (마크다운 및 일반 텍스트에서 리스트 추출)
+            json_str = ""
             json_match = re.search(r'```json\s*(\[[\s\S]*?\])\s*```', raw_response)
             if json_match:
                 json_str = json_match.group(1)
             else:
-                # 마크다운이 없는 경우 첫 번째 '[' 와 마지막 ']' 사이의 문자열 추출
-                start_idx = raw_response.find('[')
-                end_idx = raw_response.rfind(']')
-                if start_idx != -1 and end_idx != -1:
-                    json_str = raw_response[start_idx:end_idx+1]
-                else:
-                    json_str = ""
+                # 마크다운이 없는 경우 가장 바깥쪽 [ ... ] 추출 시도
+                bracket_match = re.search(r'(\[[\s\S]*\])', raw_response)
+                if bracket_match:
+                    json_str = bracket_match.group(1)
                     
             if json_str:
                 return json.loads(json_str)
@@ -258,7 +255,7 @@ def query_ollama(prompt: str) -> Optional[list[dict]]:
         except requests.exceptions.ConnectionError as e:
             err(f"연결 거부/오류 발생 (시도 {attempt}/{max_retries}): {e}")
             if attempt < max_retries:
-                info("5초 후 재시도합니다...")
+                info("5 초 후 재시도합니다...")
                 time.sleep(5)
             else:
                 err("최대 재시도 횟수를 초과했습니다.")
@@ -269,7 +266,7 @@ def query_ollama(prompt: str) -> Optional[list[dict]]:
             return None
             
         except json.JSONDecodeError:
-            err("LLM 응답을 JSON으로 파싱할 수 없습니다.")
+            err("LLM 응답을 JSON 으로 파싱할 수 없습니다.")
             return None
             
     return None
@@ -278,7 +275,7 @@ def query_ollama(prompt: str) -> Optional[list[dict]]:
 #  ✅  데이터 검증 및 DB 업데이트
 # ══════════════════════════════════════════════════════════════════════════
 def is_valid_year(year_str: str) -> bool:
-    """추론된 연도가 유효한 4자리 숫자인지 검증"""
+    """추론된 연도가 유효한 4 자리 숫자인지 검증"""
     return bool(re.match(r"^(19|20)\d{2}$", str(year_str)))
 
 def is_valid_genre(genre_str: str) -> bool:
@@ -286,7 +283,7 @@ def is_valid_genre(genre_str: str) -> bool:
     return bool(genre_str and len(genre_str) > 1 and genre_str.lower() not in ("unknown", "none", "n/a"))
 
 def process_and_update(col: chromadb.Collection, batch: list[dict], inferred_data: list[dict], dry_run: bool, source: str = "추론성공") -> int:
-    """추론/검색 결과를 검증하고 DB를 업데이트"""
+    """추론/검색 결과를 검증하고 DB 를 업데이트"""
     inferred_map = {item["id"]: item for item in inferred_data}
     emoji = "🔍" if source == "검색성공" else "🧠"
     
@@ -317,7 +314,10 @@ def process_and_update(col: chromadb.Collection, batch: list[dict], inferred_dat
             print(f"  {BOLD}{emoji} [{source}] {track['artist']} - {track['title']}{RESET}")
             print(f"     업데이트값: {update_payload}")
             if not dry_run:
-                col.update(ids=[track_id], metadatas=[update_payload])
+                if isinstance(track_id, str) and track_id.strip():
+                    col.update(ids=[track_id], metadatas=[update_payload])
+                else:
+                    warn(f"유효하지 않은 ID 로 인해 DB 업데이트를 건너뜁니다: {track_id}")
             updated_count += 1
             
     return updated_count
@@ -352,73 +352,82 @@ if __name__ == "__main__":
     success_count = 0
 
     for batch in batch_generator(unresolved_tracks, args.batch_size):
-        batch_num = processed_count + len(batch)
-        info(f"\n배치 처리 중... ({batch_num}/{total_tracks})")
-        
-        search_resolved_batch = []
-        llm_required_batch = []
-        
-        # 1단계: 검색 우선 시도 (Search First)
-        for track in batch:
-            search_data = search_track_info(track['artist'], track['title'])
+        try:
+            batch_num = processed_count + len(batch)
+            info(f"\n배치 처리 중... ({batch_num}/{total_tracks})")
             
-            fully_resolved = True
-            partial_info = {}
+            search_resolved_batch = []
+            llm_required_batch = []
             
-            if track['needs_year']:
-                if search_data.get('year') and is_valid_year(search_data['year']):
-                    partial_info['year'] = search_data['year']
+            # 1 단계: 검색 우선 시도 (Search First)
+            for track in batch:
+                search_data = search_track_info(track['artist'], track['title'])
+                
+                fully_resolved = True
+                partial_info = {}
+                
+                if track['needs_year']:
+                    if search_data.get('year') and is_valid_year(search_data['year']):
+                        partial_info['year'] = search_data['year']
+                    else:
+                        fully_resolved = False
+                        
+                if track['needs_genre']:
+                    if search_data.get('genre') and is_valid_genre(search_data['genre']):
+                        partial_info['genre'] = search_data['genre']
+                    else:
+                        fully_resolved = False
+                        
+                if fully_resolved and (track['needs_year'] or track['needs_genre']):
+                    # 검색으로 모든 누락 데이터를 찾음
+                    search_resolved_batch.append({**track, 'inference': partial_info})
                 else:
-                    fully_resolved = False
+                    # 검색으로 못 찾거나 일부만 찾은 데이터 (LLM 추론 필요)
+                    track['partial_info'] = partial_info
+                    llm_required_batch.append(track)
                     
-            if track['needs_genre']:
-                if search_data.get('genre') and is_valid_genre(search_data['genre']):
-                    partial_info['genre'] = search_data['genre']
+            # 검색으로 해결된 곡 즉시 업데이트
+            if search_resolved_batch:
+                for track in search_resolved_batch:
+                    inference_with_id = track['inference']
+                    inference_with_id['id'] = track['id']  # 누락된 'id' 키 추가
+                    process_and_update(col, [track], [inference_with_id], args.dry_run, source="검색성공")
+                    success_count += 1
+                    
+            # 2 단계: 추론 후순위 (Inference Later)
+            if llm_required_batch:
+                info(f"🔍 검색 완료. {len(llm_required_batch)}곡 LLM 추론 시작...")
+                prompt = build_prompt(llm_required_batch)
+                
+                inferred = query_ollama(prompt)
+                
+                if inferred:
+                    # 검색으로 찾은 부분 정보와 LLM 결과 병합
+                    for item in inferred:
+                        if not isinstance(item, dict):
+                            warn(f"⚠️ 잘못된 데이터 형식 스킵: {type(item).__name__} ({str(item)[:50]})")
+                            continue
+                            
+                        item_id = item.get("id")
+                        track_obj = next((t for t in llm_required_batch if t['id'] == item_id), None)
+                        if track_obj and 'partial_info' in track_obj:
+                            for k, v in track_obj['partial_info'].items():
+                                if k not in item or not item[k]:
+                                    item[k] = v
+                                    
+                    updated = process_and_update(col, llm_required_batch, inferred, args.dry_run, source="추론성공")
+                    success_count += updated
                 else:
-                    fully_resolved = False
+                    warn("이 배치에 대한 추론 실패. 다음 배치로 넘어갑니다.")
                     
-            if fully_resolved and (track['needs_year'] or track['needs_genre']):
-                # 검색으로 모든 누락 데이터를 찾음
-                search_resolved_batch.append({**track, 'inference': partial_info})
-            else:
-                # 검색으로 못 찾거나 일부만 찾은 데이터 (LLM 추론 필요)
-                track['partial_info'] = partial_info
-                llm_required_batch.append(track)
-                
-        # 검색으로 해결된 곡 즉시 업데이트
-        if search_resolved_batch:
-            for track in search_resolved_batch:
-                inference_with_id = track['inference']
-                inference_with_id['id'] = track['id']  # 누락된 'id' 키 추가
-                process_and_update(col, [track], [inference_with_id], args.dry_run, source="검색성공")
-                success_count += 1
-                
-        # 2단계: 추론 후순위 (Inference Later)
-        if llm_required_batch:
-            info(f"🔍 검색 완료. {len(llm_required_batch)}곡 LLM 추론 시작...")
-            prompt = build_prompt(llm_required_batch)
+            processed_count += len(batch)
+            # Ollama 서버 부하 방지
+            time.sleep(2)
             
-            inferred = query_ollama(prompt)
-            
-            if inferred:
-                # 검색으로 찾은 부분 정보와 LLM 결과 병합
-                for item in inferred:
-                    item_id = item.get("id")
-                    track_obj = next((t for t in llm_required_batch if t['id'] == item_id), None)
-                    if track_obj and 'partial_info' in track_obj:
-                        for k, v in track_obj['partial_info'].items():
-                            if k not in item or not item[k]:
-                                item[k] = v
-   
-            
-                updated = process_and_update(col, llm_required_batch, inferred, args.dry_run, source="추론성공")
-                success_count += updated
-            else:
-                warn("이 배치에 대한 추론 실패. 다음 배치로 넘어갑니다.")
-                
-        processed_count += len(batch)
-        # Ollama 서버 부하 방지
-        time.sleep(2)
+        except Exception as e:
+            err(f"배치 처리 중 예기치 않은 오류 발생. 이 배치를 건너뛰고 다음 배치로 넘어갑니다: {e}")
+            processed_count += len(batch)
+            continue
 
     print(f"\n{BOLD}{'═'*68}{RESET}")
     if not args.dry_run:
