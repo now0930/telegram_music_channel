@@ -35,7 +35,7 @@
 │    python metadata_fixer.py --dry-run             # 미리보기 (DB 미수정)  │
 │    python metadata_fixer.py --artist "아이유"     # 특정 아티스트만       │
 │    python metadata_fixer.py --limit 50            # 최대 50곡             │
-└──────────────────────────────────────────────────────────────────────────┘
+└──────────────────────────────────────────────────────────────────────────┐
 """
 
 from __future__ import annotations
@@ -52,6 +52,10 @@ import chromadb
 import requests
 from dotenv import load_dotenv
 
+import logging
+import traceback
+import difflib
+
 # ══════════════════════════════════════════════════════════════════════════
 #  ⚙️  전역 설정
 # ══════════════════════════════════════════════════════════════════════════
@@ -65,6 +69,17 @@ MELON_API_KEY    = os.getenv("MELON_API_KEY",    "")
 GENIE_APP_ID     = os.getenv("GENIE_APP_ID",     "")
 GENIE_APP_SECRET = os.getenv("GENIE_APP_SECRET", "")
 LASTFM_API_KEY   = os.getenv("LASTFM_API_KEY",   "")   # Last.fm (무료 가입)
+
+# ══════════════════════════════════════════════════════════════════════════
+#  🔑  API 키 매핑 사전 (아키텍처 개선)
+# ══════════════════════════════════════════════════════════════════════════
+SOURCE_KEYS = {
+    "Melon": MELON_API_KEY,
+    "Genie": GENIE_APP_ID,
+    "AudD": AUDD_API_KEY,
+    "LastFM": LASTFM_API_KEY,
+    "LastFMArtist": LASTFM_API_KEY,
+}
 
 _MB_HEADERS = {
     "User-Agent": "MusicMetaFixer/2.0 (local-home-server)",
@@ -101,7 +116,10 @@ def _is_empty_str(v: Any)  -> bool:
     return v is None or str(v).strip() == ""
 
 def _is_empty_year(v: Any) -> bool:
-    return v is None or v == 0 or str(v).strip() in ("0", "")
+    if v is None:
+        return True
+    s = str(v).strip().lower()
+    return s in ("0", "", "none", "unknown")
 
 def _is_empty_bpm(v: Any)  -> bool:
     return v is None or v == 0 or str(v).strip() in ("0", "")
@@ -138,6 +156,22 @@ ALL_FIELDS_ORDER = [
 def connect_db() -> chromadb.Collection:
     client = chromadb.PersistentClient(path=DB_PATH)
     return client.get_or_create_collection(name=COLLECTION)
+
+# ══════════════════════════════════════════════════════════════════════════
+#  📊  상태 출력 헬퍼
+# ══════════════════════════════════════════════════════════════════════════
+def print_status(col: chromadb.Collection) -> None:
+    """DB 컬렉션 상태 정보를 출력."""
+    section("📊 DB 상태")
+    count = len(col)
+    print(f"  {BOLD}총 곡 수:{RESET} {count}")
+    print(f"  {BOLD}컬렉션 이름:{RESET} {col.name}")
+    print(f"  {BOLD}DB 경로:{RESET} {DB_PATH}")
+    print(f"  {BOLD}API 키 상태:{RESET}")
+    print(f"    AUDD:   {'✅' if AUDD_API_KEY else '❌'}")
+    print(f"    Melon:  {'✅' if MELON_API_KEY else '❌'}")
+    print(f"    Genie:  {'✅' if GENIE_APP_ID else '❌'}")
+    print(f"    Last.fm: {'✅' if LASTFM_API_KEY else '❌'}")
 
 # ══════════════════════════════════════════════════════════════════════════
 #  🔍  누락 항목 탐색
@@ -192,24 +226,66 @@ def _is_instrumental_by_title(title: str) -> bool:
     return any(k in title.lower() for k in kw)
 
 # ══════════════════════════════════════════════════════════════════════════
+#  🔑  API 키 진단 및 유틸리티
+# ══════════════════════════════════════════════════════════════════════════
+def check_api_keys() -> None:
+    """현재 로드된 .env 를 바탕으로 활성화/비활성화 소스 요약 테이블 출력"""
+    section("🔑 API 소스 활성화 상태 요약")
+    
+    # API 키가 필요한 소스 출력
+    for name, key in SOURCE_KEYS.items():
+        is_active = bool(key)
+        status_str = f"{GREEN}✅ Active{RESET}" if is_active else f"{RED}❌ Disabled (키 미설정){RESET}"
+        print(f"  {BOLD}{name:<15}{RESET} : {status_str}")
+        
+    # API 키가 필요 없는 소스 출력
+    print(f"  {BOLD}{'MusicBrainz':<15}{RESET} : {GREEN}✅ Active (키 불필요){RESET}")
+    print(f"  {BOLD}{'Wikipedia':<15}{RESET} : {GREEN}✅ Active (키 불필요){RESET}")
+    print(f"  {BOLD}{'Librosa':<15}{RESET} : {GREEN}✅ Active (키 불필요){RESET}")
+
+def normalize_query(text: str) -> str:
+    """Removes special tags like Feat., (Prod. by), &, etc., to clean search queries."""
+    if not text:
+        return ""
+    # Remove contents inside parentheses/brackets starting with feat, prod, etc.
+    text = re.sub(r'\(?\s*(feat|feat\.|featuring|prod|prod\.|produced by)\s*[^)]*\)?', '', text, flags=re.IGNORECASE)
+    # Remove special characters except alphanumeric, spaces, and Hangul
+    text = re.sub(r'[^a-zA-Z0-9가-힣\s]', '', text)
+    return re.sub(r'\s+', ' ', text).strip()
+
+def is_similar_artist(original: str, fetched: str, threshold: float = 0.8) -> bool:
+    """Checks if the fetched artist name is similar enough to the original."""
+    if not original or not fetched:
+        return False
+    ratio = difflib.SequenceMatcher(None, original.lower().strip(), fetched.lower().strip()).ratio()
+    logging.info(f"    {DIM}[유사도 검사] 원본: '{original}' vs 결과: '{fetched}' → {ratio:.2f}{RESET}")
+    return ratio >= threshold
+
+# ══════════════════════════════════════════════════════════════════════════
 #  🌐  외부 API 함수들
 # ══════════════════════════════════════════════════════════════════════════
 
 def fetch_musicbrainz(artist: str, title: str, album: str = "") -> dict:
     """MusicBrainz recordings: year / genre / album / artist / mb_id 반환."""
     try:
+        url = "https://musicbrainz.org/ws/2/recording"
         query_parts = [f'recording:"{title}"', f'artist:"{artist}"']
         if album:
             query_parts.append(f'release:"{album}"')
+        params = {
+            "query": " AND ".join(query_parts),
+            "limit": 1, "fmt": "json",
+            "inc":   "releases+artist-credits+tags",
+        }
+        logging.info(f"  {CYAN}[MusicBrainz 요청] URL: {url} | Params: {params}{RESET}")
+        
         r = requests.get(
-            "https://musicbrainz.org/ws/2/recording",
-            params={
-                "query": " AND ".join(query_parts),
-                "limit": 1, "fmt": "json",
-                "inc":   "releases+artist-credits+tags",
-            },
+            url,
+            params=params,
             headers=_MB_HEADERS, timeout=10,
         )
+        logging.info(f"  {CYAN}[MusicBrainz 응답] Status: {r.status_code} | Body: {r.text[:200]}{RESET}")
+        
         time.sleep(_MB_RATE_LIMIT)
         if r.status_code != 200:
             return {}
@@ -236,7 +312,7 @@ def fetch_musicbrainz(artist: str, title: str, album: str = "") -> dict:
             "mb_id":       rec.get("id", ""),
         }.items() if v}
     except Exception as e:
-        warn(f"MusicBrainz 오류: {e}")
+        logging.error(f"MusicBrainz 오류:\n{traceback.format_exc()}")
         return {}
 
 
@@ -245,11 +321,17 @@ def fetch_musicbrainz_by_mbid(mb_id: str) -> dict:
     if not mb_id:
         return {}
     try:
+        url = f"https://musicbrainz.org/ws/2/recording/{mb_id}"
+        params = {"fmt": "json", "inc": "releases+artist-credits+tags"}
+        logging.info(f"  {CYAN}[MusicBrainz MBID 요청] URL: {url} | Params: {params}{RESET}")
+        
         r = requests.get(
-            f"https://musicbrainz.org/ws/2/recording/{mb_id}",
-            params={"fmt": "json", "inc": "releases+artist-credits+tags"},
+            url,
+            params=params,
             headers=_MB_HEADERS, timeout=10,
         )
+        logging.info(f"  {CYAN}[MusicBrainz MBID 응답] Status: {r.status_code} | Body: {r.text[:200]}{RESET}")
+        
         time.sleep(_MB_RATE_LIMIT)
         if r.status_code != 200:
             return {}
@@ -273,7 +355,7 @@ def fetch_musicbrainz_by_mbid(mb_id: str) -> dict:
             "title":       rec.get("title", ""),
         }.items() if v}
     except Exception as e:
-        warn(f"MusicBrainz MBID 오류: {e}")
+        logging.error(f"MusicBrainz MBID 오류:\n{traceback.format_exc()}")
         return {}
 
 
@@ -282,11 +364,17 @@ def fetch_melon(artist: str, title: str) -> dict:
     if not MELON_API_KEY:
         return {}
     try:
+        url = "https://openapi.melon.com/v1/search/track"
+        params = {"query": f"{artist} {title}", "count": 1}
+        logging.info(f"  {CYAN}[Melon 요청] URL: {url} | Params: {params}{RESET}")
+        
         r = requests.get(
-            "https://openapi.melon.com/v1/search/track",
-            params={"query": f"{artist} {title}", "count": 1},
+            url,
+            params=params,
             headers={"appKey": MELON_API_KEY}, timeout=10,
         )
+        logging.info(f"  {CYAN}[Melon 응답] Status: {r.status_code} | Body: {r.text[:200]}{RESET}")
+        
         tracks = r.json().get("response", {}).get("trackList", {}).get("track", [])
         if not tracks:
             return {}
@@ -300,7 +388,7 @@ def fetch_melon(artist: str, title: str) -> dict:
             "lyrics":      t.get("lyrics", ""),
         }.items() if v}
     except Exception as e:
-        warn(f"Melon 오류: {e}")
+        logging.error(f"Melon 오류:\n{traceback.format_exc()}")
         return {}
 
 
@@ -309,16 +397,22 @@ def fetch_genie(artist: str, title: str) -> dict:
     if not (GENIE_APP_ID and GENIE_APP_SECRET):
         return {}
     try:
+        url = "https://api.genie.co.kr/song/getSongInfo"
+        params = {
+            "appId":     GENIE_APP_ID,
+            "appSecret": GENIE_APP_SECRET,
+            "query":     f"{artist} {title}",
+            "count":     1,
+        }
+        logging.info(f"  {CYAN}[Genie 요청] URL: {url} | Params: {params}{RESET}")
+        
         r = requests.get(
-            "https://api.genie.co.kr/song/getSongInfo",
-            params={
-                "appId":     GENIE_APP_ID,
-                "appSecret": GENIE_APP_SECRET,
-                "query":     f"{artist} {title}",
-                "count":     1,
-            },
+            url,
+            params=params,
             timeout=10,
         )
+        logging.info(f"  {CYAN}[Genie 응답] Status: {r.status_code} | Body: {r.text[:200]}{RESET}")
+        
         songs = r.json().get("response", {}).get("songList", [])
         if not songs:
             return {}
@@ -330,7 +424,7 @@ def fetch_genie(artist: str, title: str) -> dict:
             "lyrics": s.get("lyrics",      ""),
         }.items() if v}
     except Exception as e:
-        warn(f"Genie 오류: {e}")
+        logging.error(f"Genie 오류:\n{traceback.format_exc()}")
         return {}
 
 
@@ -339,17 +433,23 @@ def fetch_lastfm(artist: str, title: str) -> dict:
     if not LASTFM_API_KEY:
         return {}
     try:
+        url = "https://ws.audioscrobbler.com/2.0/"
+        params = {
+            "method":  "track.getInfo",
+            "api_key": LASTFM_API_KEY,
+            "artist":  artist,
+            "track":   title,
+            "format":  "json",
+        }
+        logging.info(f"  {CYAN}[Last.fm 요청] URL: {url} | Params: {params}{RESET}")
+        
         r = requests.get(
-            "https://ws.audioscrobbler.com/2.0/",
-            params={
-                "method":  "track.getInfo",
-                "api_key": LASTFM_API_KEY,
-                "artist":  artist,
-                "track":   title,
-                "format":  "json",
-            },
+            url,
+            params=params,
             timeout=10,
         )
+        logging.info(f"  {CYAN}[Last.fm 응답] Status: {r.status_code} | Body: {r.text[:200]}{RESET}")
+        
         track = r.json().get("track", {})
         if not track:
             return {}
@@ -368,7 +468,7 @@ def fetch_lastfm(artist: str, title: str) -> dict:
             "_lastfm_summary":  summary[:400],
         }.items() if v}
     except Exception as e:
-        warn(f"Last.fm 오류: {e}")
+        logging.error(f"Last.fm 오류:\n{traceback.format_exc()}")
         return {}
 
 
@@ -377,16 +477,22 @@ def fetch_lastfm_artist(artist: str) -> dict:
     if not LASTFM_API_KEY:
         return {}
     try:
+        url = "https://ws.audioscrobbler.com/2.0/"
+        params = {
+            "method":  "artist.getInfo",
+            "api_key": LASTFM_API_KEY,
+            "artist":  artist,
+            "format":  "json",
+        }
+        logging.info(f"  {CYAN}[Last.fm Artist 요청] URL: {url} | Params: {params}{RESET}")
+        
         r = requests.get(
-            "https://ws.audioscrobbler.com/2.0/",
-            params={
-                "method":  "artist.getInfo",
-                "api_key": LASTFM_API_KEY,
-                "artist":  artist,
-                "format":  "json",
-            },
+            url,
+            params=params,
             timeout=10,
         )
+        logging.info(f"  {CYAN}[Last.fm Artist 응답] Status: {r.status_code} | Body: {r.text[:200]}{RESET}")
+        
         art_data  = r.json().get("artist", {})
         if not art_data:
             return {}
@@ -399,7 +505,7 @@ def fetch_lastfm_artist(artist: str) -> dict:
             "_lastfm_bio":   bio[:400],
         }.items() if v}
     except Exception as e:
-        warn(f"Last.fm artist 오류: {e}")
+        logging.error(f"Last.fm artist 오류:\n{traceback.format_exc()}")
         return {}
 
 
@@ -410,14 +516,21 @@ def fetch_audd(file_path: str) -> dict:
     if not os.path.exists(file_path):
         return {}
     try:
+        url = "https://api.audd.io/"
+        params = {"api_token": AUDD_API_KEY, "return": "lyrics,spotify"}
+        logging.info(f"  {CYAN}[AudD 요청] URL: {url} | Params: {params}{RESET}")
+        
         with open(file_path, "rb") as f:
             chunk = f.read(500_000)
+        
         r = requests.post(
-            "https://api.audd.io/",
-            data={"api_token": AUDD_API_KEY, "return": "lyrics,spotify"},
+            url,
+            data=params,
             files={"file": ("audio.mp3", chunk, "audio/mpeg")},
             timeout=30,
         )
+        logging.info(f"  {CYAN}[AudD 응답] Status: {r.status_code} | Body: {r.text[:200]}{RESET}")
+        
         result = r.json().get("result") or {}
         if not result:
             return {}
@@ -432,7 +545,7 @@ def fetch_audd(file_path: str) -> dict:
             "lyrics": lyrics_field,
         }.items() if v}
     except Exception as e:
-        warn(f"AudD 오류: {e}")
+        logging.error(f"AudD 오류:\n{traceback.format_exc()}")
         return {}
 
 
@@ -440,25 +553,30 @@ def fetch_wikipedia(artist: str, title: str) -> dict:
     """Wikipedia: year / genre 텍스트 파싱 + extract 반환."""
     result: dict = {}
     try:
-        query = f"{artist} {title} song"
+        url = "https://en.wikipedia.org/w/api.php"
+        params = {
+            "action":   "query",
+            "list":     "search",
+            "srsearch": f"{artist} {title} song",
+            "srlimit":  2,
+            "format":   "json",
+        }
+        logging.info(f"  {CYAN}[Wikipedia 요청] URL: {url} | Params: {params}{RESET}")
+        
         r = requests.get(
-            "https://en.wikipedia.org/w/api.php",
-            params={
-                "action":   "query",
-                "list":     "search",
-                "srsearch": query,
-                "srlimit":  2,
-                "format":   "json",
-            },
+            url,
+            params=params,
             headers={"User-Agent": "MusicMetaFixer/2.0"}, timeout=6,
         )
+        logging.info(f"  {CYAN}[Wikipedia 응답] Status: {r.status_code} | Body: {r.text[:200]}{RESET}")
+        
         items = r.json().get("query", {}).get("search", [])
         for item in items[:2]:
             pg_title = item.get("title", "")
             if not pg_title:
                 continue
             r2 = requests.get(
-                "https://en.wikipedia.org/w/api.php",
+                url,
                 params={
                     "action":      "query",
                     "prop":        "extracts",
@@ -469,6 +587,8 @@ def fetch_wikipedia(artist: str, title: str) -> dict:
                 },
                 headers={"User-Agent": "MusicMetaFixer/2.0"}, timeout=6,
             )
+            logging.info(f"  {CYAN}[Wikipedia Extract 요청] Status: {r2.status_code} | Body: {r2.text[:200]}{RESET}")
+            
             pages = r2.json().get("query", {}).get("pages", {})
             for page in pages.values():
                 extract = (page.get("extract") or "").strip()
@@ -493,28 +613,8 @@ def fetch_wikipedia(artist: str, title: str) -> dict:
                 if not result.get("_wiki_extract"):
                     result["_wiki_extract"] = extract[:400]
     except Exception as e:
-        warn(f"Wikipedia 오류: {e}")
+        logging.error(f"Wikipedia 오류:\n{traceback.format_exc()}")
     return result
-
-
-def analyze_bpm_local(file_path: str) -> dict:
-    """librosa 로컬 BPM 분석 (파일 필요)."""
-    if not os.path.exists(file_path):
-        return {}
-    try:
-        import warnings
-        import librosa
-        warnings.filterwarnings("ignore")
-        y, sr    = librosa.load(file_path, sr=22050, mono=True, offset=30, duration=30)
-        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-        bpm      = int(round(float(tempo[0]) if hasattr(tempo, "__len__") else float(tempo)))
-        return {"bpm": str(bpm)} if bpm > 0 else {}
-    except ImportError:
-        warn("librosa 미설치 — pip install librosa")
-        return {}
-    except Exception as e:
-        warn(f"BPM 분석 오류: {e}")
-        return {}
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -547,149 +647,126 @@ def lookup_field(field: str, meta: dict, file_path: str) -> Optional[Any]:
     field 에 맞는 외부 API 를 순서대로 호출하여 새 값을 반환.
     찾지 못하면 None 반환. embedding 은 절대 건드리지 않음.
     """
-    artist  = (meta.get("artist")  or "").strip()
-    title   = (meta.get("title")   or "").strip()
+    artist_raw = (meta.get("artist")  or "").strip()
+    title_raw  = (meta.get("title")   or "").strip()
+    
+    # Normalized queries for better API hits
+    artist  = normalize_query(artist_raw)
+    title   = normalize_query(title_raw)
+    
     album   = (meta.get("album")   or "").strip()
     mb_id   = (meta.get("mb_id")   or "").strip()
-    bpm_cur = meta.get("bpm",  0)
-    year_cur= str(meta.get("year", "") or "")
+    
+    # 동적 소스 필터링을 위한 헬퍼 함수
+    def is_enabled(src_name: str) -> bool:
+        """해당 소스의 API 키가 존재할 때만 True 반환"""
+        return bool(SOURCE_KEYS.get(src_name))
 
-    # ── 자동 계산 필드 (API 불필요) ───────────────────────────────
-
-    if field == "bpm_range":
-        if not _is_empty_bpm(bpm_cur):
-            val = _bpm_to_range(bpm_cur)
-            if val:
-                found("자동계산", field, val)
-                return val
-        return None
-
-    if field == "era":
-        if not _is_empty_year(year_cur):
-            val = _normalize_era(year_cur)
-            if val:
-                found("자동계산", field, val)
-                return val
-        return None
-
-    # ── BPM : librosa ────────────────────────────────────────────
-    if field == "bpm":
-        res = analyze_bpm_local(file_path)
-        if res.get("bpm"):
-            found("librosa", field, res["bpm"])
-            return res["bpm"]
-        return None
-
-    # ── is_instrumental ───────────────────────────────────────────
-    if field == "is_instrumental":
-        if title and _is_instrumental_by_title(title):
-            found("title키워드", field, "True")
-            return "True"
-        ad = fetch_audd(file_path)
-        if ad.get("title"):
-            val = str(_is_instrumental_by_title(ad["title"]))
-            found("AudD", field, val)
-            return val
-        return None
-
-    # ── mb_id ─────────────────────────────────────────────────────
-    if field == "mb_id":
-        if artist and title:
-            mb = fetch_musicbrainz(artist, title, album)
-            if mb.get("mb_id"):
-                found("MusicBrainz", field, mb["mb_id"])
-                return mb["mb_id"]
-        return None
-
-    # ── lyrics ────────────────────────────────────────────────────
-    if field == "lyrics":
-        if artist and title:
-            for src_name, fn in [
-                ("Melon", lambda: fetch_melon(artist, title)),
-                ("Genie", lambda: fetch_genie(artist, title)),
-            ]:
-                res = fn()
-                if res.get("lyrics"):
-                    found(src_name, field, res["lyrics"][:30] + "…")
-                    return res["lyrics"]
-        ad = fetch_audd(file_path)
-        if ad.get("lyrics"):
-            found("AudD", field, ad["lyrics"][:30] + "…")
-            return ad["lyrics"]
-        return None
-
-    # ── mood ──────────────────────────────────────────────────────
-    if field == "mood":
-        combined = ""
-        if artist and title:
-            combined += fetch_lastfm(artist, title).get("_lastfm_summary", "")
-            combined += fetch_lastfm_artist(artist).get("_lastfm_bio", "")
-            combined += fetch_wikipedia(artist, title).get("_wiki_extract", "")
-        val = infer_mood(combined)
-        if val:
-            found("텍스트분석", field, val)
-            return val
-        return None
-
-    # ── 공통 소스 풀 탐색: year / genre / genre_fixed / album / artist / title
-    sources: list[tuple[str, dict]] = []
-
-    # mb_id 역조회 우선
+    # 1. MusicBrainz (mb_id 역조회 우선)
     if mb_id:
         mb_by_id = fetch_musicbrainz_by_mbid(mb_id)
         if mb_by_id:
-            sources.append(("MusicBrainz(mbid)", mb_by_id))
-
+            sources: list[tuple[str, dict]] = [("MusicBrainz(mbid)", mb_by_id)]
+        else:
+            sources = []
+    else:
+        sources = []
+    
     if artist and title:
-        # MusicBrainz (중복 방지)
+        # MusicBrainz (키 불필요)
         if not any(s[0].startswith("MusicBrainz") for s in sources):
             mb = fetch_musicbrainz(artist, title, album)
             if mb:
                 sources.append(("MusicBrainz", mb))
 
-        # Melon
-        if field in ("year", "genre", "genre_fixed", "album", "artist", "lyrics"):
+        # Melon (필터링 적용)
+        if field in ("year", "genre", "genre_fixed", "album", "artist", "lyrics") and is_enabled("Melon"):
             ml = fetch_melon(artist, title)
             if ml:
                 sources.append(("Melon", ml))
 
-        # Genie
-        if field in ("year", "album", "artist", "lyrics"):
+        # Genie (필터링 적용)
+        if field in ("year", "album", "artist", "lyrics") and is_enabled("Genie"):
             gn = fetch_genie(artist, title)
             if gn:
                 sources.append(("Genie", gn))
 
-        # Last.fm (track)
-        if field in ("genre", "genre_fixed", "year", "album"):
+        # Last.fm (track) (필터링 적용)
+        if field in ("genre", "genre_fixed", "year", "album") and is_enabled("LastFM"):
             lf = fetch_lastfm(artist, title)
             if lf:
                 sources.append(("Last.fm", lf))
 
-        # Last.fm (artist) — genre 보조
-        if field in ("genre", "genre_fixed"):
+        # Last.fm (artist) — genre 보조 (필터링 적용)
+        if field in ("genre", "genre_fixed") and is_enabled("LastFMArtist"):
             if not any(s[1].get(field) for s in sources):
                 lfa = fetch_lastfm_artist(artist)
                 if lfa:
                     sources.append(("Last.fm(artist)", lfa))
 
-        # Wikipedia
+        # Wikipedia (키 불필요)
         if field in ("year", "genre", "genre_fixed"):
             wp = fetch_wikipedia(artist, title)
             if wp:
                 sources.append(("Wikipedia", wp))
-
-    # artist / title 없을 때 → AudD
-    if (not artist or not title) and field in (
-        "year", "genre", "genre_fixed", "album", "artist", "title", "lyrics"
-    ):
-        ad = fetch_audd(file_path)
-        if ad:
-            sources.append(("AudD", ad))
-
-    # 첫 번째로 찾은 유효값 반환
+    
+    # 2. AudD (파일 기반, 필터링 적용)
+    if file_path and field in ("year", "album", "artist", "title", "lyrics") and is_enabled("AudD"):
+        au = fetch_audd(file_path)
+        if au:
+            sources.append(("AudD", au))
+    
+    # 3. Mood 추론 (텍스트 기반)
+    if field == "mood":
+        text = (meta.get("lyrics") or meta.get("summary") or "").strip()
+        if text:
+            mood = infer_mood(text)
+            if mood:
+                sources.append(("MoodInfer", {"mood": mood}))
+    
+    # 4. BPM 계산 (파일 기반)
+    if field == "bpm":
+        if file_path and os.path.exists(file_path):
+            try:
+                import librosa
+                y, sr = librosa.load(file_path, duration=30)
+                tempo = librosa.beat.beat_track(y=y, sr=sr)
+                bpm = int(round(tempo))
+                if bpm:
+                    sources.append(("Librosa", {"bpm": bpm}))
+            except Exception:
+                pass
+    
+    # 5. BPM Range 자동 계산
+    if field == "bpm_range":
+        bpm_val = meta.get("bpm")
+        if bpm_val:
+            sources.append(("AutoCalc", {"bpm_range": _bpm_to_range(bpm_val)}) if bpm_val else None)
+    
+    # 6. Era 자동 계산
+    if field == "era":
+        year_val = meta.get("year")
+        if year_val:
+            sources.append(("AutoCalc", {"era": _normalize_era(year_val)}) if year_val else None)
+    
+    # 7. Instrumental 자동 판정
+    if field == "is_instrumental":
+        if _is_instrumental_by_title(title_raw):
+            sources.append(("AutoCalc", {"is_instrumental": "true"}))
+        elif meta.get("is_instrumental"):
+            sources.append(("AutoCalc", {"is_instrumental": "true"}))
+    
+    # 8. 첫 번째로 찾은 유효값 반환 (데이터 검증 로직 포함)
     for src_name, data in sources:
         val = data.get(field, "")
         if val and str(val).strip() not in ("", "0", "none", "None"):
+            # If the field is 'year' or 'album', validate the artist similarity
+            if field in ("year", "album") and src_name not in ("자동계산", "AudD"):
+                fetched_artist = data.get("artist", "")
+                if fetched_artist and not is_similar_artist(artist_raw, fetched_artist):
+                    warn(f"[{src_name}] 아티스트 유사도 미달로 {field}={val} 폐기")
+                    continue 
+            
             found(src_name, field, val)
             return str(val).strip()
 
@@ -697,286 +774,76 @@ def lookup_field(field: str, meta: dict, file_path: str) -> Optional[Any]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  💾  DB 업데이트 (embedding 보존)
-# ══════════════════════════════════════════════════════════════════════════
-def update_field(
-    col:     chromadb.Collection,
-    doc_id:  str,
-    meta:    dict,
-    field:   str,
-    new_val: Any,
-) -> bool:
-    """embedding / document 는 그대로, 해당 field 만 수정 후 upsert."""
-    try:
-        existing     = col.get(ids=[doc_id], include=["embeddings", "documents"])
-        existing_emb = existing["embeddings"][0] if existing.get("embeddings") else None
-        existing_doc = existing["documents"][0]  if existing.get("documents")  else ""
-
-        updated_meta = dict(meta)
-        _, store_type, _ = FIELD_META[field]
-        if store_type == "int":
-            try:
-                updated_meta[field] = int(float(str(new_val)))
-            except (ValueError, TypeError):
-                updated_meta[field] = 0
-        else:
-            updated_meta[field] = str(new_val)
-
-        kwargs: dict = {
-            "ids":       [doc_id],
-            "metadatas": [updated_meta],
-            "documents": [existing_doc],
-        }
-        if existing_emb is not None:
-            kwargs["embeddings"] = [existing_emb]
-
-        col.upsert(**kwargs)
-        return True
-    except Exception as e:
-        err(f"DB 업데이트 실패: {e}")
-        return False
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  📊  현황 통계 출력
-# ══════════════════════════════════════════════════════════════════════════
-def print_status(col: chromadb.Collection) -> None:
-    header("📊 메타데이터 누락 현황")
-    all_data = col.get(include=["metadatas"])
-    total    = len(all_data["ids"])
-    metas    = all_data["metadatas"]
-
-    if total == 0:
-        warn("DB 가 비어있습니다.")
-        return
-
-    print(f"\n  총 곡 수: {BOLD}{total}{RESET}\n")
-    print(f"  {'필드':<16} {'설명':<16} {'누락':>5} {'비율':>7}   {'진행바 (20칸)'}")
-    print(f"  {'─'*16} {'─'*16} {'─'*5} {'─'*7}   {'─'*22}")
-
-    for field in ALL_FIELDS_ORDER:
-        check, _, desc = FIELD_META[field]
-        miss  = sum(1 for m in metas if check(m.get(field)))
-        pct   = miss / total * 100
-        bar_n = int(pct / 5)
-        bar   = "█" * bar_n + "░" * (20 - bar_n)
-        color = RED if pct > 50 else YELLOW if pct > 10 else GREEN
-        print(
-            f"  {field:<16} {desc:<16} {color}{miss:>5}{RESET} "
-            f"{pct:>6.1f}%   [{color}{bar}{RESET}]"
-        )
-
-    # ── year 연도 분포 ──────────────────────────────────────────
-    section("year 연도 분포  (빨강 = 0/누락)")
-    year_dist: dict[str, int] = {}
-    for m in metas:
-        y = str(m.get("year", 0))
-        year_dist[y] = year_dist.get(y, 0) + 1
-    for yr, cnt in sorted(year_dist.items())[:25]:
-        bar = "█" * min(cnt, 50)
-        clr = RED if yr in ("0", "") else RESET
-        print(f"  {clr}{yr:>6}{RESET}  {bar}  ({cnt})")
-    if len(year_dist) > 25:
-        print(f"  {DIM}... 외 {len(year_dist)-25}개 연도{RESET}")
-
-    # ── genre 분포 (상위 15) ────────────────────────────────────
-    section("genre 분포  (상위 15)")
-    genre_dist: dict[str, int] = {}
-    for m in metas:
-        g = str(m.get("genre") or "").strip() or "(없음)"
-        genre_dist[g] = genre_dist.get(g, 0) + 1
-    for g, cnt in sorted(genre_dist.items(), key=lambda x: -x[1])[:15]:
-        bar = "█" * min(cnt, 50)
-        clr = RED if g == "(없음)" else RESET
-        print(f"  {clr}{g:<22}{RESET}  {bar}  ({cnt})")
-    print()
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  🔧  단일 필드 수정 루프
-# ══════════════════════════════════════════════════════════════════════════
-def run_fixer(
-    col:           chromadb.Collection,
-    field:         str,
-    artist_filter: str  = "",
-    limit:         int  = 0,
-    dry_run:       bool = False,
-) -> tuple[int, int]:
-    """누락 항목을 찾아 수정. (fixed, failed) 반환."""
-    _, _, desc = FIELD_META[field]
-
-    section(f"누락 탐색  [{field}]  {desc}")
-    missing = find_missing(col, field, artist_filter, limit)
-    total   = len(missing)
-
-    if not total:
-        ok(f"누락 없음  (field={field})")
-        return 0, 0
-
-    print(f"\n  수정 대상: {BOLD}{RED}{total}{RESET}곡")
-    print(f"\n  {'#':<5} {'아티스트':<24} {'제목':<32} {'현재값'}")
-    print(f"  {'─'*5} {'─'*24} {'─'*32} {'─'*14}")
-    for i, item in enumerate(missing[:10], 1):
-        m   = item["meta"]
-        cur = str(m.get(field, "-"))[:14]
-        print(
-            f"  {i:<5} {(m.get('artist') or '?')[:23]:<24} "
-            f"{(m.get('title') or m.get('filename') or '?')[:31]:<32} {cur}"
-        )
-    if total > 10:
-        print(f"  {DIM}... 외 {total-10}곡{RESET}")
-
-    fixed = failed = 0
-    start = datetime.now()
-
-    for idx, item in enumerate(missing, 1):
-        doc_id = item["id"]
-        meta   = item["meta"]
-        artist = (meta.get("artist") or "").strip()
-        titl   = (meta.get("title")  or "").strip()
-        fname  = meta.get("filename", os.path.basename(doc_id))
-        disp   = f"{artist or '?'} - {titl or fname}"
-        elapsed= int((datetime.now() - start).total_seconds())
-
-        print(
-            f"\n  [{idx:>4}/{total}]  {disp[:62]}"
-            f"  {DIM}(경과 {elapsed}s){RESET}"
-        )
-
-        new_val = lookup_field(field, meta, doc_id)
-
-        if new_val is not None:
-            if dry_run:
-                ok(f"[DRY-RUN]  {field} = {str(new_val)[:60]!r}  (미적용)")
-                fixed += 1
-            else:
-                if update_field(col, doc_id, meta, field, new_val):
-                    old = str(meta.get(field, "?"))[:20]
-                    ok(f"{field}: {old!r} → {str(new_val)[:40]!r}")
-                    fixed += 1
-                else:
-                    failed += 1
-        else:
-            warn(f"탐색 실패 — {field} 값을 찾을 수 없음")
-            failed += 1
-
-    return fixed, failed
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  🚀  전체 실행 (단일 / 복수 필드)
-# ══════════════════════════════════════════════════════════════════════════
-def run(
-    fields:        list[str],
-    artist_filter: str  = "",
-    limit:         int  = 0,
-    dry_run:       bool = False,
-) -> None:
-    col = connect_db()
-
-    header("🔧 메타데이터 수정기  v2")
-    print(f"  DB 경로      : {DB_PATH}")
-    print(f"  총 항목 수   : {col.count()}")
-    print(f"  대상 필드    : {BOLD}{', '.join(fields)}{RESET}")
-    if artist_filter: print(f"  아티스트 필터: {artist_filter}")
-    if limit:         print(f"  처리 한도    : {limit}곡")
-    if dry_run:       print(f"  {YELLOW}** DRY-RUN 모드 — DB 미수정 **{RESET}")
-
-    # 실행 전 현황
-    print_status(col)
-
-    grand_fixed = grand_failed = 0
-    start_all   = datetime.now()
-
-    for field in fields:
-        header(f"📝 처리 중: {field}  ({FIELD_META[field][2]})")
-        fx, fl = run_fixer(col, field, artist_filter, limit, dry_run)
-        grand_fixed  += fx
-        grand_failed += fl
-
-    # 최종 리포트
-    elapsed = int((datetime.now() - start_all).total_seconds())
-    header("📋 최종 완료 리포트")
-    print(f"""
-  처리 필드    : {', '.join(fields)}
-  ✅ 수정 성공 : {GREEN}{grand_fixed}{RESET}
-  ❌ 탐색 실패 : {RED}{grand_failed}{RESET}
-  소요 시간    : {elapsed}초
-  완료 시각    : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-  {'[DRY-RUN — 실제 DB 변경 없음]' if dry_run else ''}
-""")
-
-    if not dry_run:
-        section("수정 후 현황")
-        print_status(col)
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  CLI
+#  🚀  메인 실행
 # ══════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    SUPPORTED = list(FIELD_META.keys())
-
-    parser = argparse.ArgumentParser(
-        description="ChromaDB 음악 메타데이터 수정 도구 v2",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "지원 필드:\n" +
-            "".join(f"  {f:<16} — {FIELD_META[f][2]}\n" for f in ALL_FIELDS_ORDER) +
-            """
-예시:
-  python metadata_fixer.py --status
-  python metadata_fixer.py                              # year 누락 수정
-  python metadata_fixer.py --field genre                # genre 수정
-  python metadata_fixer.py --fields year,genre,album    # 복수 필드
-  python metadata_fixer.py --all-fields                 # 모든 필드 순서대로
-  python metadata_fixer.py --dry-run --fields year,bpm  # 미리보기
-  python metadata_fixer.py --artist "아이유" --limit 20
-"""
-        ),
-    )
-    parser.add_argument(
-        "--field",  default="year", choices=SUPPORTED, metavar="FIELD",
-        help=f"수정할 필드 1개 (기본: year). 선택: {', '.join(SUPPORTED)}",
-    )
-    parser.add_argument(
-        "--fields", default="", metavar="F1,F2,...",
-        help="콤마 구분 복수 필드 (--field 보다 우선)",
-    )
-    parser.add_argument(
-        "--all-fields", action="store_true",
-        help="모든 필드를 순서대로 처리",
-    )
-    parser.add_argument("--artist",  default="", metavar="가수명",
-                        help="특정 아티스트만")
-    parser.add_argument("--limit",   type=int, default=0, metavar="N",
-                        help="최대 처리 곡 수 (0=무제한)")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="탐색만, DB 미수정")
-    parser.add_argument("--status",  action="store_true",
-                        help="현황 통계만 출력 후 종료")
+    parser = argparse.ArgumentParser(description="ChromaDB 메타데이터 수정 도구")
+    parser.add_argument("--status", action="store_true", help="전체 상태만 출력")
+    parser.add_argument("--field",  type=str, default="", help="수정할 필드명 (예: year)")
+    parser.add_argument("--fields", type=str, default="", help="수정할 필드명 목록 (예: year,genre)")
+    parser.add_argument("--all-fields", action="store_true", help="모든 필드 순서대로 수정")
+    parser.add_argument("--artist", type=str, default="", help="아티스트 필터 (예: 아이유)")
+    parser.add_argument("--limit",   type=int, default=0, help="최대 수정 개수 (0=전체)")
+    parser.add_argument("--dry-run", action="store_true", help="미리보기 (DB 미수정)")
     args = parser.parse_args()
 
+    # API 키 로드 확인
+    check_api_keys()
+
     if args.status:
-        print_status(connect_db())
+        col = connect_db()
+        print_status(col)
         sys.exit(0)
 
-    # 필드 목록 결정
-    if args.all_fields:
-        target_fields = ALL_FIELDS_ORDER
-    elif args.fields:
-        raw = [f.strip() for f in args.fields.split(",") if f.strip()]
-        bad = [f for f in raw if f not in SUPPORTED]
-        if bad:
-            print(f"[오류] 지원하지 않는 필드: {bad}\n지원 목록: {SUPPORTED}")
-            sys.exit(1)
-        target_fields = raw
-    else:
-        target_fields = [args.field]
+    col = connect_db()
+    if not col:
+        err("DB 연결 실패")
+        sys.exit(1)
 
-    run(
-        fields        = target_fields,
-        artist_filter = args.artist,
-        limit         = args.limit,
-        dry_run       = args.dry_run,
-    )
+    # 필드 목록 결정
+    fields_to_fix: list[str] = []
+    if args.all_fields:
+        fields_to_fix = ALL_FIELDS_ORDER
+    elif args.fields:
+        fields_to_fix = [f.strip() for f in args.fields.split(",") if f.strip()]
+    elif args.field:
+        fields_to_fix = [args.field]
+    else:
+        fields_to_fix = ["year"]
+
+    if not fields_to_fix:
+        err("필드명 지정 없음 (--field, --fields, --all-fields 중 하나 필요)")
+        sys.exit(1)
+
+    # 전체 누락 항목 탐색
+    all_missing: list[dict] = []
+    for field in fields_to_fix:
+        missing = find_missing(col, field, artist_filter=args.artist, limit=args.limit)
+        all_missing.extend(missing)
+
+    if not all_missing:
+        ok("수정할 누락 항목 없음")
+        sys.exit(0)
+
+    # 수정 로직
+    for item in all_missing:
+        doc_id = item["id"]
+        meta   = item["meta"]
+        file_path = meta.get("file_path", "")
+        
+        for field in fields_to_fix:
+            if field not in meta:
+                continue
+            
+            new_val = lookup_field(field, meta, file_path)
+            if new_val is not None:
+                if not args.dry_run:
+                    col.update(ids=[doc_id], metadatas=[{field: new_val}])
+                ok(f"{doc_id[:8]}... {field} → {new_val}")
+            else:
+                info(f"{doc_id[:8]}... {field} → (찾을 수 없음)")
+
+    if not args.dry_run:
+        ok("수정이 완료되었습니다.")
+    else:
+        info("Dry-run 모드입니다. DB 는 수정되지 않았습니다.")
