@@ -12,6 +12,8 @@ music_bot.py — Telegram Music Bot (개선판)
   - SQLite DB 추가 (사용자 접근 제어, 메시지 TTL 관리)
   - LRU 사용자 관리 (최대 10 명)
   - 7 일 TTL 메시지 자동 삭제
+  - ChromaDB 예외 처리, 쿼리 방어 코드, 필터 타입 검증 추가
+  - 파일 전송 안정성 및 사용자 경험 개선 (status_msg, timeout, 쿨타임)
 """
 
 import os
@@ -26,13 +28,14 @@ import aiosqlite
 
 import ollama
 import chromadb
+from chromadb.errors import InternalError as ChromaInternalError
 from telegram import Update
 from telegram.error import TelegramError
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
-# ══════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════════════
 #  📋  로깅 설정
-# ══════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════════════
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -40,9 +43,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("music_bot")
 
-# ══════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════════════
 #  ⚙️  설정
-# ══════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════════════
 MUSIC_PATH   = "/music"
 DB_PATH      = "./music_vector_db"
 TEXT_MODEL   = "gemma4:e4b"
@@ -66,15 +69,20 @@ if _missing:
     logger.critical("❌ 필수 환경 변수 미설정: %s", ", ".join(_missing))
     sys.exit(1)
 
-# ══════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════════════
 #  🗄️  DB 연결
-# ══════════════════════════════════════════════════════════════════
-_chroma    = chromadb.PersistentClient(path=DB_PATH)
-collection = _chroma.get_or_create_collection(name="music_library")
+# ═════════════════════════════════════════════════════════════════════════════════════
+try:
+    _chroma    = chromadb.PersistentClient(path=DB_PATH)
+    collection = _chroma.get_or_create_collection(name="music_library")
+except ChromaInternalError as e:
+    logger.error("ChromaDB 컬렉션 로드 중 InternalError. 컬렉션 삭제 후 재구성합니다: %s", e)
+    _chroma.delete_collection("music_library")
+    collection = _chroma.get_or_create_collection(name="music_library")
 
-# ══════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════════════
 #  🛠️  유틸리티
-# ══════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════════════
 async def init_db():
     async with aiosqlite.connect(BOT_DB_PATH) as db:
         await db.execute("""
@@ -153,9 +161,9 @@ def truncate_caption(text: str, limit: int = CAPTION_LIMIT) -> str:
     """Telegram caption 길이 제한을 초과하면 말줄임표를 붙여 자른다."""
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
-# ══════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════════════
 #  🤖  LLM 의도 추출 (비동기 래핑)
-# ══════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════════════
 def _extract_intent_sync(user_query: str) -> dict:
     """
     동기 함수. asyncio.to_thread() 를 통해 호출된다.
@@ -202,9 +210,9 @@ async def extract_intent(user_query: str) -> dict:
     """동기 LLM 호출을 별도 스레드에서 실행하여 이벤트 루프를 블로킹하지 않는다."""
     return await asyncio.to_thread(_extract_intent_sync, user_query)
 
-# ══════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════════════
 #  🔍  폴백 로직 포함 벡터 검색 (비동기 래핑)
-# ══════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════════════
 def _search_music_sync(intent: dict) -> tuple[list[str], list[dict]]:
     """
     동기 함수. asyncio.to_thread() 를 통해 호출된다.
@@ -226,7 +234,11 @@ def _search_music_sync(intent: dict) -> tuple[list[str], list[dict]]:
             
         # 연도(year) 필터링
         if current_intent.get("year"):
-            filter_list.append({"year": current_intent["year"]})
+            try:
+                year_val = int(current_intent["year"])
+                filter_list.append({"year": year_val})
+            except (ValueError, TypeError):
+                pass
 
         # 🖍️ 시대(era) 필터링 (예: "90 년대" -> 1990 ~ 1999, "2010 년대" -> 2010 ~ 2019)
         if current_intent.get("era") and not current_intent.get("year"):
@@ -271,12 +283,35 @@ def _search_music_sync(intent: dict) -> tuple[list[str], list[dict]]:
     doc_filter = {"$contains": keywords[0]} if keywords else None
 
     def _do_query(n: int, where_c=None, where_doc=None):
-        return collection.query(
-            query_embeddings=[query_embed],
-            n_results=safe_n(n),
-            where=where_c,
-            where_document=where_doc
-        )
+        max_retries = 2
+        for attempt in range(1, max_retries + 1):
+            try:
+                return collection.query(
+                    query_embeddings=[query_embed],
+                    n_results=safe_n(n),
+                    where=where_c,
+                    where_document=where_doc
+                )
+            except ChromaInternalError as e:
+                logger.error(
+                    "쿼리 실행 중 ChromaDB InternalError 발생 (시도 %d/%d). Intent: %s. 에러: %s",
+                    attempt, max_retries, intent, e
+                )
+                
+                # DB 연결 상태 점검 (heartbeat)
+                try:
+                    _chroma.heartbeat()
+                    logger.info("ChromaDB heartbeat 체크 완료.")
+                except Exception as hb_err:
+                    logger.error("ChromaDB heartbeat 체크 실패: %s", hb_err)
+                
+                # 최대 재시도 횟수 초과 시 예외 발생시켜 상위 핸들러로 전달
+                if attempt >= max_retries:
+                    logger.error("쿼리 재시도 모두 실패. Intent: %s", intent)
+                    raise
+                
+                # 1 초 대기 후 재시도
+                time.sleep(1.0)
 
     def _unpack(results: dict) -> tuple[list, list]:
         return results.get("ids", [[]])[0], results.get("metadatas", [[]])[0]
@@ -319,9 +354,9 @@ async def search_music(intent: dict) -> tuple[list[str], list[dict]]:
     """동기 검색 함수를 별도 스레드에서 실행한다."""
     return await asyncio.to_thread(_search_music_sync, intent)
 
-# ══════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════════════
 #  📨  텔레그램 전송
-# ══════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════════════
 async def send_music_files(
     context: ContextTypes.DEFAULT_TYPE,
     target_chat_id: int,
@@ -329,6 +364,7 @@ async def send_music_files(
     file_paths: list[str],
     metadatas: list[dict],
     user_query: str,
+    status_msg,  # 진행 상황 업데이트를 위한 메시지 객체 추가
 ) -> int:
     """음악 파일을 target_chat_id 로 전송하고 성공 건수를 반환한다."""
     success = 0
@@ -345,6 +381,9 @@ async def send_music_files(
             errors.append(display)
             continue
 
+        # 진행 상황 업데이트
+        await safe_edit(status_msg, f"🎧 [{i}/{total}] 전송 중: {display}")
+
         caption = truncate_caption(
             f"[{i}/{total}] {display}\n🔍 요청: {user_query}"
         )
@@ -355,6 +394,8 @@ async def send_music_files(
                     chat_id=target_chat_id,
                     audio=audio,
                     caption=caption,
+                    write_timeout=120,  # 타임아웃 명시적 상향
+                    connect_timeout=120 # 타임아웃 명시적 상향
                 )
             success += 1
             async with aiosqlite.connect(BOT_DB_PATH) as db:
@@ -364,10 +405,17 @@ async def send_music_files(
                 )
                 await db.commit()
             logger.info("[%d/%d] 전송 완료: %s", i, total, display)
-            await asyncio.sleep(1.0)
+            
+            # 마지막 곡이 아니면 2 초 쿨타임 적용
+            if i < total:
+                await asyncio.sleep(2)
+                
         except TelegramError as e:
             logger.error("전송 실패 [%s]: %s", display, e)
             errors.append(display)
+            # 개별 실패 시 사용자에게 알리고 계속 진행
+            await safe_edit(status_msg, f"⚠️ [{i}/{total}] 일부 곡 전송에 실패했습니다. 다음 곡을 계속 진행합니다...")
+            await asyncio.sleep(2)
         except OSError as e:
             logger.error("파일 읽기 오류 [%s]: %s", path, e)
             errors.append(display)
@@ -379,9 +427,9 @@ async def send_music_files(
 
     return success
 
-# ══════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════════════
 #  🤖  텔레그램 메시지 핸들러
-# ══════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════════════
 async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
         return
@@ -407,8 +455,12 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         intent = await extract_intent(user_query)
         logger.info("추출된 intent: %s", intent)
 
-        # 2 단계: 벡터 검색
-        file_paths, metadatas = await search_music(intent)
+        # 2 단계: 벡터 검색 (ChromaDB 오류 시 사용자 안내)
+        try:
+            file_paths, metadatas = await search_music(intent)
+        except ChromaInternalError:
+            await safe_edit(status_msg, "❌ 데이터베이스 인덱스 최적화 중입니다. 잠시 후 다시 시도해주세요.")
+            return
 
         if not file_paths:
             await safe_edit(status_msg, "😢 검색 결과가 없습니다.")
@@ -417,16 +469,16 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await safe_edit(status_msg, f"🎧 {len(file_paths)}곡을 찾았습니다. 전송을 시작합니다!")
 
         # 3 단계: 파일 전송
-        success = await send_music_files(context, chat_id, update, file_paths, metadatas, user_query)
+        success = await send_music_files(context, chat_id, update, file_paths, metadatas, user_query, status_msg)
         await update.message.reply_text(f"✅ 전송 완료: {success}/{len(file_paths)}곡")
 
     except Exception as e:
         logger.exception("handle_query 처리 중 예외 발생: %s", e)
         await safe_edit(status_msg, "❌ 처리 중 오류가 발생했습니다. 다시 시도해 주세요.")
 
-# ══════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════════════
 #  🚀  진입점
-# ══════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════════════
 async def post_init(application):
     await init_db()
     asyncio.create_task(ttl_cleanup_task(application))

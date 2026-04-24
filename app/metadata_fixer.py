@@ -163,8 +163,29 @@ def connect_db() -> chromadb.Collection:
 def print_status(col: chromadb.Collection) -> None:
     """DB 컬렉션 상태 정보를 출력."""
     section("📊 DB 상태")
-    count = len(col)
-    print(f"  {BOLD}총 곡 수:{RESET} {count}")
+    try:
+        # 1. len(col) 대신 col.count() 사용
+        count = col.count()
+        print(f"  {BOLD}총 곡 수:{RESET} {count}")
+        
+        # 2. 미해결(누락) 데이터 개수 확인 로직 추가
+        if count > 0:
+            all_data = col.get(include=["metadatas"])
+            check_year, _, _ = FIELD_META["year"]
+            check_genre, _, _ = FIELD_META["genre"]
+            
+            missing_year = sum(1 for m in all_data["metadatas"] if check_year(m.get("year")))
+            missing_genre = sum(1 for m in all_data["metadatas"] if check_genre(m.get("genre")))
+            
+            print(f"  {BOLD}미해결 데이터:{RESET}")
+            print(f"    - year 누락: {missing_year}곡")
+            print(f"    - genre 누락: {missing_genre}곡")
+            
+    except Exception as e:
+        # 3. 예외 처리 추가
+        err(f"DB 상태 조회 중 오류 발생: {e}")
+        return
+
     print(f"  {BOLD}컬렉션 이름:{RESET} {col.name}")
     print(f"  {BOLD}DB 경로:{RESET} {DB_PATH}")
     print(f"  {BOLD}API 키 상태:{RESET}")
