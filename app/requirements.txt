@@ -4,3 +4,4 @@ chromadb
 mutagen
 librosa
 aiosqlite
+google-genai
