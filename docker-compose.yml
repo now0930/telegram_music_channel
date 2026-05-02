@@ -23,9 +23,9 @@ services:
       - MUSIC_CHANNEL_ID=${MUSIC_CHANNEL_ID}
 
     networks:
-      - aider_jupyter_default
+      - ollama_network
     restart: always
 
 networks:
-  aider_jupyter_default:
+  ollama_network:
     external: true
