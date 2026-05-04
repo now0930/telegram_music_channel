@@ -143,7 +143,6 @@ FIELD_META: dict[str, tuple] = {
     "lyrics":          (_is_empty_str,      "str", "가사"),
 }
 
-# 전체 자동 수정 시 처리 순서
 ALL_FIELDS_ORDER = [
     "year", "genre", "genre_fixed", "album", "artist",
     "title", "bpm", "bpm_range", "era", "mood",
@@ -164,11 +163,9 @@ def print_status(col: chromadb.Collection) -> None:
     """DB 컬렉션 상태 정보를 출력."""
     section("📊 DB 상태")
     try:
-        # 1. len(col) 대신 col.count() 사용
         count = col.count()
         print(f"  {BOLD}총 곡 수:{RESET} {count}")
         
-        # 2. 미해결(누락) 데이터 개수 확인 로직 추가
         if count > 0:
             all_data = col.get(include=["metadatas"])
             check_year, _, _ = FIELD_META["year"]
@@ -182,7 +179,6 @@ def print_status(col: chromadb.Collection) -> None:
             print(f"    - genre 누락: {missing_genre}곡")
             
     except Exception as e:
-        # 3. 예외 처리 추가
         err(f"DB 상태 조회 중 오류 발생: {e}")
         return
 
@@ -203,7 +199,6 @@ def find_missing(
     artist_filter: str = "",
     limit:         int = 0,
 ) -> list[dict]:
-    """field 값이 비어있는 항목 목록 반환."""
     check, _, _ = FIELD_META[field]
     all_data     = col.get(include=["metadatas"])
     missing: list[dict] = []
@@ -224,7 +219,6 @@ def _clean_year(raw: str) -> str:
     return m.group(1) if m else ""
 
 def _normalize_era(year_str: str) -> str:
-    """'1998' → '1990년대'"""
     m = re.search(r"(1[89]\d{2}|20\d{2})", str(year_str))
     if not m:
         return ""
@@ -250,32 +244,24 @@ def _is_instrumental_by_title(title: str) -> bool:
 #  🔑  API 키 진단 및 유틸리티
 # ══════════════════════════════════════════════════════════════════════════
 def check_api_keys() -> None:
-    """현재 로드된 .env 를 바탕으로 활성화/비활성화 소스 요약 테이블 출력"""
     section("🔑 API 소스 활성화 상태 요약")
-    
-    # API 키가 필요한 소스 출력
     for name, key in SOURCE_KEYS.items():
         is_active = bool(key)
         status_str = f"{GREEN}✅ Active{RESET}" if is_active else f"{RED}❌ Disabled (키 미설정){RESET}"
         print(f"  {BOLD}{name:<15}{RESET} : {status_str}")
         
-    # API 키가 필요 없는 소스 출력
     print(f"  {BOLD}{'MusicBrainz':<15}{RESET} : {GREEN}✅ Active (키 불필요){RESET}")
     print(f"  {BOLD}{'Wikipedia':<15}{RESET} : {GREEN}✅ Active (키 불필요){RESET}")
     print(f"  {BOLD}{'Librosa':<15}{RESET} : {GREEN}✅ Active (키 불필요){RESET}")
 
 def normalize_query(text: str) -> str:
-    """Removes special tags like Feat., (Prod. by), &, etc., to clean search queries."""
     if not text:
         return ""
-    # Remove contents inside parentheses/brackets starting with feat, prod, etc.
     text = re.sub(r'\(?\s*(feat|feat\.|featuring|prod|prod\.|produced by)\s*[^)]*\)?', '', text, flags=re.IGNORECASE)
-    # Remove special characters except alphanumeric, spaces, and Hangul
     text = re.sub(r'[^a-zA-Z0-9가-힣\s]', '', text)
     return re.sub(r'\s+', ' ', text).strip()
 
 def is_similar_artist(original: str, fetched: str, threshold: float = 0.8) -> bool:
-    """Checks if the fetched artist name is similar enough to the original."""
     if not original or not fetched:
         return False
     ratio = difflib.SequenceMatcher(None, original.lower().strip(), fetched.lower().strip()).ratio()
@@ -287,7 +273,6 @@ def is_similar_artist(original: str, fetched: str, threshold: float = 0.8) -> bo
 # ══════════════════════════════════════════════════════════════════════════
 
 def fetch_musicbrainz(artist: str, title: str, album: str = "") -> dict:
-    """MusicBrainz recordings: year / genre / album / artist / mb_id 반환."""
     try:
         url = "https://musicbrainz.org/ws/2/recording"
         query_parts = [f'recording:"{title}"', f'artist:"{artist}"']
@@ -300,16 +285,16 @@ def fetch_musicbrainz(artist: str, title: str, album: str = "") -> dict:
         }
         logging.info(f"  {CYAN}[MusicBrainz 요청] URL: {url} | Params: {params}{RESET}")
         
-        r = requests.get(
-            url,
-            params=params,
-            headers=_MB_HEADERS, timeout=10,
-        )
-        logging.info(f"  {CYAN}[MusicBrainz 응답] Status: {r.status_code} | Body: {r.text[:200]}{RESET}")
+        r = requests.get(url, params=params, headers=_MB_HEADERS, timeout=10)
         
-        time.sleep(_MB_RATE_LIMIT)
         if r.status_code != 200:
+            logging.warning(f"  [MusicBrainz] 응답 실패 (Status: {r.status_code})")
+            time.sleep(_MB_RATE_LIMIT)
             return {}
+
+        logging.info(f"  {CYAN}[MusicBrainz 응답] Status: {r.status_code} | Body: {r.text[:200]}{RESET}")
+        time.sleep(_MB_RATE_LIMIT)
+        
         recs = r.json().get("recordings", [])
         if not recs:
             return {}
@@ -332,13 +317,19 @@ def fetch_musicbrainz(artist: str, title: str, album: str = "") -> dict:
             "artist":      artist_val,
             "mb_id":       rec.get("id", ""),
         }.items() if v}
+        
+    except requests.exceptions.Timeout:
+        logging.warning("  [MusicBrainz] API 응답 시간 초과 (Timeout)")
+        return {}
+    except requests.exceptions.RequestException as e:
+        logging.warning(f"  [MusicBrainz] 네트워크 오류: {e}")
+        return {}
     except Exception as e:
-        logging.error(f"MusicBrainz 오류:\n{traceback.format_exc()}")
+        logging.error(f"  [MusicBrainz] 처리 중 오류: {e}")
         return {}
 
 
 def fetch_musicbrainz_by_mbid(mb_id: str) -> dict:
-    """mb_id 로 직접 recording 조회 (역방향 보강)."""
     if not mb_id:
         return {}
     try:
@@ -346,16 +337,16 @@ def fetch_musicbrainz_by_mbid(mb_id: str) -> dict:
         params = {"fmt": "json", "inc": "releases+artist-credits+tags"}
         logging.info(f"  {CYAN}[MusicBrainz MBID 요청] URL: {url} | Params: {params}{RESET}")
         
-        r = requests.get(
-            url,
-            params=params,
-            headers=_MB_HEADERS, timeout=10,
-        )
-        logging.info(f"  {CYAN}[MusicBrainz MBID 응답] Status: {r.status_code} | Body: {r.text[:200]}{RESET}")
+        r = requests.get(url, params=params, headers=_MB_HEADERS, timeout=10)
         
-        time.sleep(_MB_RATE_LIMIT)
         if r.status_code != 200:
+            logging.warning(f"  [MusicBrainz MBID] 응답 실패 (Status: {r.status_code})")
+            time.sleep(_MB_RATE_LIMIT)
             return {}
+
+        logging.info(f"  {CYAN}[MusicBrainz MBID 응답] Status: {r.status_code} | Body: {r.text[:200]}{RESET}")
+        time.sleep(_MB_RATE_LIMIT)
+        
         rec       = r.json()
         releases  = rec.get("releases", [])
         year_val  = album_val = ""
@@ -375,13 +366,19 @@ def fetch_musicbrainz_by_mbid(mb_id: str) -> dict:
             "artist":      artist_val,
             "title":       rec.get("title", ""),
         }.items() if v}
+        
+    except requests.exceptions.Timeout:
+        logging.warning("  [MusicBrainz MBID] API 응답 시간 초과 (Timeout)")
+        return {}
+    except requests.exceptions.RequestException as e:
+        logging.warning(f"  [MusicBrainz MBID] 네트워크 오류: {e}")
+        return {}
     except Exception as e:
-        logging.error(f"MusicBrainz MBID 오류:\n{traceback.format_exc()}")
+        logging.error(f"  [MusicBrainz MBID] 처리 중 오류: {e}")
         return {}
 
 
 def fetch_melon(artist: str, title: str) -> dict:
-    """Melon Open API: year / genre / album / artist / lyrics 반환."""
     if not MELON_API_KEY:
         return {}
     try:
@@ -389,11 +386,12 @@ def fetch_melon(artist: str, title: str) -> dict:
         params = {"query": f"{artist} {title}", "count": 1}
         logging.info(f"  {CYAN}[Melon 요청] URL: {url} | Params: {params}{RESET}")
         
-        r = requests.get(
-            url,
-            params=params,
-            headers={"appKey": MELON_API_KEY}, timeout=10,
-        )
+        r = requests.get(url, params=params, headers={"appKey": MELON_API_KEY}, timeout=10)
+        
+        if r.status_code != 200:
+            logging.warning(f"  [Melon] 응답 실패 (Status: {r.status_code})")
+            return {}
+
         logging.info(f"  {CYAN}[Melon 응답] Status: {r.status_code} | Body: {r.text[:200]}{RESET}")
         
         tracks = r.json().get("response", {}).get("trackList", {}).get("track", [])
@@ -408,13 +406,19 @@ def fetch_melon(artist: str, title: str) -> dict:
             "artist":      t.get("artistList", [{}])[0].get("artistName", ""),
             "lyrics":      t.get("lyrics", ""),
         }.items() if v}
+        
+    except requests.exceptions.Timeout:
+        logging.warning("  [Melon] API 응답 시간 초과 (Timeout)")
+        return {}
+    except requests.exceptions.RequestException as e:
+        logging.warning(f"  [Melon] 네트워크 오류: {e}")
+        return {}
     except Exception as e:
-        logging.error(f"Melon 오류:\n{traceback.format_exc()}")
+        logging.error(f"  [Melon] 처리 중 오류: {e}")
         return {}
 
 
 def fetch_genie(artist: str, title: str) -> dict:
-    """Genie Music API: year / album / artist / lyrics 반환."""
     if not (GENIE_APP_ID and GENIE_APP_SECRET):
         return {}
     try:
@@ -427,11 +431,12 @@ def fetch_genie(artist: str, title: str) -> dict:
         }
         logging.info(f"  {CYAN}[Genie 요청] URL: {url} | Params: {params}{RESET}")
         
-        r = requests.get(
-            url,
-            params=params,
-            timeout=10,
-        )
+        r = requests.get(url, params=params, timeout=10)
+        
+        if r.status_code != 200:
+            logging.warning(f"  [Genie] 응답 실패 (Status: {r.status_code})")
+            return {}
+
         logging.info(f"  {CYAN}[Genie 응답] Status: {r.status_code} | Body: {r.text[:200]}{RESET}")
         
         songs = r.json().get("response", {}).get("songList", [])
@@ -444,13 +449,19 @@ def fetch_genie(artist: str, title: str) -> dict:
             "artist": s.get("artistName",  ""),
             "lyrics": s.get("lyrics",      ""),
         }.items() if v}
+        
+    except requests.exceptions.Timeout:
+        logging.warning("  [Genie] API 응답 시간 초과 (Timeout)")
+        return {}
+    except requests.exceptions.RequestException as e:
+        logging.warning(f"  [Genie] 네트워크 오류: {e}")
+        return {}
     except Exception as e:
-        logging.error(f"Genie 오류:\n{traceback.format_exc()}")
+        logging.error(f"  [Genie] 처리 중 오류: {e}")
         return {}
 
 
 def fetch_lastfm(artist: str, title: str) -> dict:
-    """Last.fm track.getInfo: genre(tag) / year / album + summary 반환."""
     if not LASTFM_API_KEY:
         return {}
     try:
@@ -464,11 +475,12 @@ def fetch_lastfm(artist: str, title: str) -> dict:
         }
         logging.info(f"  {CYAN}[Last.fm 요청] URL: {url} | Params: {params}{RESET}")
         
-        r = requests.get(
-            url,
-            params=params,
-            timeout=10,
-        )
+        r = requests.get(url, params=params, timeout=10)
+        
+        if r.status_code != 200:
+            logging.warning(f"  [Last.fm] 응답 실패 (Status: {r.status_code})")
+            return {}
+
         logging.info(f"  {CYAN}[Last.fm 응답] Status: {r.status_code} | Body: {r.text[:200]}{RESET}")
         
         track = r.json().get("track", {})
@@ -488,13 +500,19 @@ def fetch_lastfm(artist: str, title: str) -> dict:
             "album":            album_val,
             "_lastfm_summary":  summary[:400],
         }.items() if v}
+        
+    except requests.exceptions.Timeout:
+        logging.warning("  [Last.fm] API 응답 시간 초과 (Timeout)")
+        return {}
+    except requests.exceptions.RequestException as e:
+        logging.warning(f"  [Last.fm] 네트워크 오류: {e}")
+        return {}
     except Exception as e:
-        logging.error(f"Last.fm 오류:\n{traceback.format_exc()}")
+        logging.error(f"  [Last.fm] 처리 중 오류: {e}")
         return {}
 
 
 def fetch_lastfm_artist(artist: str) -> dict:
-    """Last.fm artist.getInfo: genre(tag) + bio 반환."""
     if not LASTFM_API_KEY:
         return {}
     try:
@@ -507,11 +525,12 @@ def fetch_lastfm_artist(artist: str) -> dict:
         }
         logging.info(f"  {CYAN}[Last.fm Artist 요청] URL: {url} | Params: {params}{RESET}")
         
-        r = requests.get(
-            url,
-            params=params,
-            timeout=10,
-        )
+        r = requests.get(url, params=params, timeout=10)
+        
+        if r.status_code != 200:
+            logging.warning(f"  [Last.fm Artist] 응답 실패 (Status: {r.status_code})")
+            return {}
+
         logging.info(f"  {CYAN}[Last.fm Artist 응답] Status: {r.status_code} | Body: {r.text[:200]}{RESET}")
         
         art_data  = r.json().get("artist", {})
@@ -525,13 +544,19 @@ def fetch_lastfm_artist(artist: str) -> dict:
             "genre_fixed":   genre_val,
             "_lastfm_bio":   bio[:400],
         }.items() if v}
+        
+    except requests.exceptions.Timeout:
+        logging.warning("  [Last.fm Artist] API 응답 시간 초과 (Timeout)")
+        return {}
+    except requests.exceptions.RequestException as e:
+        logging.warning(f"  [Last.fm Artist] 네트워크 오류: {e}")
+        return {}
     except Exception as e:
-        logging.error(f"Last.fm artist 오류:\n{traceback.format_exc()}")
+        logging.error(f"  [Last.fm Artist] 처리 중 오류: {e}")
         return {}
 
 
 def fetch_audd(file_path: str) -> dict:
-    """AudD 오디오 인식: year / title / artist / album / lyrics 반환."""
     if not AUDD_API_KEY:
         return {}
     if not os.path.exists(file_path):
@@ -550,6 +575,11 @@ def fetch_audd(file_path: str) -> dict:
             files={"file": ("audio.mp3", chunk, "audio/mpeg")},
             timeout=30,
         )
+        
+        if r.status_code != 200:
+            logging.warning(f"  [AudD] 응답 실패 (Status: {r.status_code})")
+            return {}
+
         logging.info(f"  {CYAN}[AudD 응답] Status: {r.status_code} | Body: {r.text[:200]}{RESET}")
         
         result = r.json().get("result") or {}
@@ -565,13 +595,19 @@ def fetch_audd(file_path: str) -> dict:
             "album":  result.get("album",  ""),
             "lyrics": lyrics_field,
         }.items() if v}
+        
+    except requests.exceptions.Timeout:
+        logging.warning("  [AudD] API 응답 시간 초과 (Timeout)")
+        return {}
+    except requests.exceptions.RequestException as e:
+        logging.warning(f"  [AudD] 네트워크 오류: {e}")
+        return {}
     except Exception as e:
-        logging.error(f"AudD 오류:\n{traceback.format_exc()}")
+        logging.error(f"  [AudD] 처리 중 오류: {e}")
         return {}
 
 
 def fetch_wikipedia(artist: str, title: str) -> dict:
-    """Wikipedia: year / genre 텍스트 파싱 + extract 반환."""
     result: dict = {}
     try:
         url = "https://en.wikipedia.org/w/api.php"
@@ -584,11 +620,12 @@ def fetch_wikipedia(artist: str, title: str) -> dict:
         }
         logging.info(f"  {CYAN}[Wikipedia 요청] URL: {url} | Params: {params}{RESET}")
         
-        r = requests.get(
-            url,
-            params=params,
-            headers={"User-Agent": "MusicMetaFixer/2.0"}, timeout=6,
-        )
+        r = requests.get(url, params=params, headers={"User-Agent": "MusicMetaFixer/2.0"}, timeout=6)
+        
+        if r.status_code != 200:
+            logging.warning(f"  [Wikipedia] API 요청 실패 (상태 코드: {r.status_code})")
+            return result
+
         logging.info(f"  {CYAN}[Wikipedia 응답] Status: {r.status_code} | Body: {r.text[:200]}{RESET}")
         
         items = r.json().get("query", {}).get("search", [])
@@ -608,8 +645,10 @@ def fetch_wikipedia(artist: str, title: str) -> dict:
                 },
                 headers={"User-Agent": "MusicMetaFixer/2.0"}, timeout=6,
             )
-            logging.info(f"  {CYAN}[Wikipedia Extract 요청] Status: {r2.status_code} | Body: {r2.text[:200]}{RESET}")
             
+            if r2.status_code != 200:
+                continue
+
             pages = r2.json().get("query", {}).get("pages", {})
             for page in pages.values():
                 extract = (page.get("extract") or "").strip()
@@ -633,8 +672,14 @@ def fetch_wikipedia(artist: str, title: str) -> dict:
                         result["genre_fixed"] = g
                 if not result.get("_wiki_extract"):
                     result["_wiki_extract"] = extract[:400]
+                    
+    except requests.exceptions.Timeout:
+        logging.warning("  [Wikipedia] API 응답 시간 초과 (Timeout)")
+    except requests.exceptions.RequestException as e:
+        logging.warning(f"  [Wikipedia] 네트워크 오류: {e}")
     except Exception as e:
-        logging.error(f"Wikipedia 오류:\n{traceback.format_exc()}")
+        logging.error(f"  [Wikipedia] 처리 중 오류: {e}")
+        
     return result
 
 
@@ -664,26 +709,18 @@ def infer_mood(text: str) -> str:
 #  🔑  필드별 탐색 전략
 # ══════════════════════════════════════════════════════════════════════════
 def lookup_field(field: str, meta: dict, file_path: str) -> Optional[Any]:
-    """
-    field 에 맞는 외부 API 를 순서대로 호출하여 새 값을 반환.
-    찾지 못하면 None 반환. embedding 은 절대 건드리지 않음.
-    """
     artist_raw = (meta.get("artist")  or "").strip()
     title_raw  = (meta.get("title")   or "").strip()
     
-    # Normalized queries for better API hits
     artist  = normalize_query(artist_raw)
     title   = normalize_query(title_raw)
     
     album   = (meta.get("album")   or "").strip()
     mb_id   = (meta.get("mb_id")   or "").strip()
     
-    # 동적 소스 필터링을 위한 헬퍼 함수
     def is_enabled(src_name: str) -> bool:
-        """해당 소스의 API 키가 존재할 때만 True 반환"""
         return bool(SOURCE_KEYS.get(src_name))
 
-    # 1. MusicBrainz (mb_id 역조회 우선)
     if mb_id:
         mb_by_id = fetch_musicbrainz_by_mbid(mb_id)
         if mb_by_id:
@@ -694,50 +731,42 @@ def lookup_field(field: str, meta: dict, file_path: str) -> Optional[Any]:
         sources = []
     
     if artist and title:
-        # MusicBrainz (키 불필요)
         if not any(s[0].startswith("MusicBrainz") for s in sources):
             mb = fetch_musicbrainz(artist, title, album)
             if mb:
                 sources.append(("MusicBrainz", mb))
 
-        # Melon (필터링 적용)
         if field in ("year", "genre", "genre_fixed", "album", "artist", "lyrics") and is_enabled("Melon"):
             ml = fetch_melon(artist, title)
             if ml:
                 sources.append(("Melon", ml))
 
-        # Genie (필터링 적용)
         if field in ("year", "album", "artist", "lyrics") and is_enabled("Genie"):
             gn = fetch_genie(artist, title)
             if gn:
                 sources.append(("Genie", gn))
 
-        # Last.fm (track) (필터링 적용)
         if field in ("genre", "genre_fixed", "year", "album") and is_enabled("LastFM"):
             lf = fetch_lastfm(artist, title)
             if lf:
                 sources.append(("Last.fm", lf))
 
-        # Last.fm (artist) — genre 보조 (필터링 적용)
         if field in ("genre", "genre_fixed") and is_enabled("LastFMArtist"):
             if not any(s[1].get(field) for s in sources):
                 lfa = fetch_lastfm_artist(artist)
                 if lfa:
                     sources.append(("Last.fm(artist)", lfa))
 
-        # Wikipedia (키 불필요)
         if field in ("year", "genre", "genre_fixed"):
             wp = fetch_wikipedia(artist, title)
             if wp:
                 sources.append(("Wikipedia", wp))
     
-    # 2. AudD (파일 기반, 필터링 적용)
     if file_path and field in ("year", "album", "artist", "title", "lyrics") and is_enabled("AudD"):
         au = fetch_audd(file_path)
         if au:
             sources.append(("AudD", au))
     
-    # 3. Mood 추론 (텍스트 기반)
     if field == "mood":
         text = (meta.get("lyrics") or meta.get("summary") or "").strip()
         if text:
@@ -745,7 +774,6 @@ def lookup_field(field: str, meta: dict, file_path: str) -> Optional[Any]:
             if mood:
                 sources.append(("MoodInfer", {"mood": mood}))
     
-    # 4. BPM 계산 (파일 기반)
     if field == "bpm":
         if file_path and os.path.exists(file_path):
             try:
@@ -758,30 +786,25 @@ def lookup_field(field: str, meta: dict, file_path: str) -> Optional[Any]:
             except Exception:
                 pass
     
-    # 5. BPM Range 자동 계산
     if field == "bpm_range":
         bpm_val = meta.get("bpm")
         if bpm_val:
             sources.append(("AutoCalc", {"bpm_range": _bpm_to_range(bpm_val)}) if bpm_val else None)
     
-    # 6. Era 자동 계산
     if field == "era":
         year_val = meta.get("year")
         if year_val:
             sources.append(("AutoCalc", {"era": _normalize_era(year_val)}) if year_val else None)
     
-    # 7. Instrumental 자동 판정
     if field == "is_instrumental":
         if _is_instrumental_by_title(title_raw):
             sources.append(("AutoCalc", {"is_instrumental": "true"}))
         elif meta.get("is_instrumental"):
             sources.append(("AutoCalc", {"is_instrumental": "true"}))
     
-    # 8. 첫 번째로 찾은 유효값 반환 (데이터 검증 로직 포함)
     for src_name, data in sources:
         val = data.get(field, "")
         if val and str(val).strip() not in ("", "0", "none", "None"):
-            # If the field is 'year' or 'album', validate the artist similarity
             if field in ("year", "album") and src_name not in ("자동계산", "AudD"):
                 fetched_artist = data.get("artist", "")
                 if fetched_artist and not is_similar_artist(artist_raw, fetched_artist):
@@ -808,7 +831,6 @@ if __name__ == "__main__":
     parser.add_argument("--dry-run", action="store_true", help="미리보기 (DB 미수정)")
     args = parser.parse_args()
 
-    # API 키 로드 확인
     check_api_keys()
 
     if args.status:
@@ -821,7 +843,6 @@ if __name__ == "__main__":
         err("DB 연결 실패")
         sys.exit(1)
 
-    # 필드 목록 결정
     fields_to_fix: list[str] = []
     if args.all_fields:
         fields_to_fix = ALL_FIELDS_ORDER
@@ -836,7 +857,6 @@ if __name__ == "__main__":
         err("필드명 지정 없음 (--field, --fields, --all-fields 중 하나 필요)")
         sys.exit(1)
 
-    # 전체 누락 항목 탐색
     all_missing: list[dict] = []
     for field in fields_to_fix:
         missing = find_missing(col, field, artist_filter=args.artist, limit=args.limit)
@@ -846,7 +866,6 @@ if __name__ == "__main__":
         ok("수정할 누락 항목 없음")
         sys.exit(0)
 
-    # 수정 로직
     for item in all_missing:
         doc_id = item["id"]
         meta   = item["meta"]
@@ -860,9 +879,9 @@ if __name__ == "__main__":
             if new_val is not None:
                 if not args.dry_run:
                     col.update(ids=[doc_id], metadatas=[{field: new_val}])
-                ok(f"{doc_id[:8]}... {field} → {new_val}")
+                ok(f"{doc_id[:40]}... {field} → {new_val}")
             else:
-                info(f"{doc_id[:8]}... {field} → (찾을 수 없음)")
+                info(f"{doc_id[:40]}... {field} → (찾을 수 없음)")
 
     if not args.dry_run:
         ok("수정이 완료되었습니다.")
