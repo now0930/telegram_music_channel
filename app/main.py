@@ -24,6 +24,8 @@ from chromadb.errors import InternalError as ChromaInternalError
 from telegram import Update
 from telegram.error import TelegramError
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+from agent_tools import music_tools
+from artist_aliases import ARTIST_ALIASES  
 
 # 최신 구글 생성형 AI 라이브러리 (2026년 표준)
 try:
@@ -46,7 +48,8 @@ logger = logging.getLogger("music_bot")
 # ═════════════════════════════════════════════════════════════════════════════════════
 MUSIC_PATH   = "/music"
 DB_PATH      = "./music_vector_db"
-TEXT_MODEL   = "gemma4:26b"  # 내부 폴백용 모델
+#TEXT_MODEL   = "gemma4:26b"  # 내부 폴백용 모델
+TEXT_MODEL   = os.getenv("OLLAMA_MODEL", "hermes3")
 EMBED_MODEL  = "mxbai-embed-large"
 MAX_RESULTS  = 10   
 CAPTION_LIMIT = 1024  
@@ -70,7 +73,8 @@ GEMINI_MODEL_NAME = "gemini-3.1-flash-lite-preview"
 
 # Gemini 초기화 (새로운 클라이언트 방식)
 client_gemini = None
-if genai and GEMINI_API_KEY:
+# Gemini를 끄고 로컬 Hermes 모델만 사용하도록 강제 (False 처리)
+if False:
     try:
         client_gemini = genai.Client(api_key=GEMINI_API_KEY)
         logger.info(f"✅ 최신 Gemini API 설정 완료. (모델: {GEMINI_MODEL_NAME}) 하이브리드 엔진 모드로 동작합니다.")
@@ -182,22 +186,45 @@ def _extract_intent_sync(user_query: str) -> dict:
         except Exception as e:
             logger.warning(f"⚠️ Gemini 오류 발생, Ollama({TEXT_MODEL})로 전환: {e}")
 
-    # 2. Ollama(gemma4:26b)로 폴백
+    # 2. Hermes 에이전트를 통한 Function Calling (도구 호출)
     try:
-        resp = ollama.generate(
-            model=TEXT_MODEL, 
-            prompt=intent_prompt, 
-            stream=False, 
+        response = ollama.chat(
+            model=TEXT_MODEL,
+            messages=[
+                # 챗봇 자아를 완전히 삭제하는 아주 강력한 시스템 프롬프트
+                {
+                    'role': 'system',
+                    'content': '당신은 시스템 백엔드 API입니다. 절대로 사용자와 대화하거나 인삿말, 설명을 출력하지 마세요. 입력이 단어 1개이든 불완전한 문장이든, 무조건 `search_local_music` 도구(Function)만 호출하여 JSON을 반환해야 합니다.'
+                },
+                {'role': 'user', 'content': user_query}
+            ],
+            tools=music_tools,
             options={"temperature": 0}
         )
-        raw = resp.get("response", "").strip()
-        match = re.search(r"\{.*?\}", raw, re.DOTALL)
-        if match:
-            return json.loads(match.group())
-    except Exception as e:
-        logger.error(f"❌ 모델({TEXT_MODEL}) 의도 추출 실패: {e}")
 
+        # 모델이 도구를 정상적으로 호출한 경우
+        if response.message.tool_calls:
+            tool = response.message.tool_calls[0]
+            function_name = tool.function.name
+            arguments = tool.function.arguments
+
+            logger.info(f"🛠️ 도구 선택됨: {function_name} | 추출된 파라미터: {arguments}")
+
+            if function_name == 'search_local_music':
+                if 'count' not in arguments or not arguments['count']:
+                    arguments['count'] = 5
+                return arguments
+
+        # 도구를 호출하지 않고 텍스트로 대답해버린 경우 (원인 파악용 로그 추가)
+        else:
+            logger.warning(f"⚠️ 에이전트가 도구를 무시함. 모델의 텍스트 대답: {response.message.content}")
+
+    except Exception as e:
+        logger.error(f"❌ 에이전트 실행 실패: {e}")
+
+    # 최종 실패 시 폴백
     return {"keyword": user_query, "count": 5}
+
 
 async def extract_intent(user_query: str) -> dict:
     return await asyncio.to_thread(_extract_intent_sync, user_query)
@@ -210,21 +237,47 @@ def _search_music_sync(intent: dict) -> tuple[list[str], list[dict]]:
     db_count = collection.count()
     def safe_n(n): return max(1, min(n, db_count))
 
-    # [0단계] 텍스트 기반 직접 필터링 시도 (정확도 향상의 핵심)
+    # ═════════════════════════════════════════════════════════════════════════
+    # [0단계] 폴더(Alias 포함) 및 텍스트 기반 직접 하드 매칭
+    # ═════════════════════════════════════════════════════════════════════════
     search_keyword = intent.get("title") or intent.get("artist") or intent.get("keyword")
+    raw_dir = intent.get("directory", "")
     
-    if search_keyword:
-        logger.info(f"[0단계] 키워드 직접 매칭 시도: {search_keyword}")
+    # 동의어 사전을 이용한 디렉토리 타겟 리스트 생성
+    search_dir_clean = raw_dir.replace(" ", "").lower() if raw_dir else ""
+    target_dirs = ARTIST_ALIASES.get(search_dir_clean, [search_dir_clean]) if search_dir_clean else []
+
+    if search_keyword or target_dirs:
+        logger.info(f"[0단계] 하드 매칭 시도: 키워드({search_keyword}), 폴더({target_dirs})")
         all_data = collection.get(include=["metadatas"])
-        match_ids = []
-        match_metas = []
+        match_ids, match_metas = [], []
         
         for i, meta in enumerate(all_data["metadatas"]):
             title = meta.get("title", "")
             artist = meta.get("artist", "")
-            # 띄어쓰기를 무시하고 포함 여부 검사
-            if search_keyword.replace(" ", "") in title.replace(" ", "") or \
-               search_keyword.replace(" ", "") in artist.replace(" ", ""):
+            path = meta.get("path", "")
+            
+            path_clean = path.replace(" ", "").lower()
+            title_clean = title.replace(" ", "").lower()
+            artist_clean = artist.replace(" ", "").lower()
+            
+            is_match = False
+            
+            # 1. 폴더 조건 확인
+            if target_dirs:
+                dir_matched = any(d in path_clean for d in target_dirs if d)
+                if not dir_matched:
+                    continue # 폴더 조건이 있는데 안 맞으면 무조건 스킵
+                    
+            # 2. 키워드 조건 확인
+            if not search_keyword:
+                is_match = True
+            else:
+                keyword_clean = search_keyword.replace(" ", "").lower()
+                if keyword_clean in title_clean or keyword_clean in artist_clean:
+                    is_match = True
+
+            if is_match:
                 match_ids.append(all_data["ids"][i])
                 match_metas.append(meta)
         
@@ -232,21 +285,97 @@ def _search_music_sync(intent: dict) -> tuple[list[str], list[dict]]:
             logger.info(f"✅ 직접 매칭 성공! {len(match_ids)}곡 발견")
             return match_ids[:target_count], match_metas[:target_count]
 
-    # [1단계] 필터 생성 및 벡터 검색 준비
+    # ═════════════════════════════════════════════════════════════════════════
+    # [1단계] ChromaDB 메타데이터 필터(where) 생성
+    # ═════════════════════════════════════════════════════════════════════════
     def _build_where(current_intent):
         filter_list = []
-        if current_intent.get("bpm_range") == "high": filter_list.append({"bpm": {"$gte": 120}})
-        elif current_intent.get("bpm_range") == "low": filter_list.append({"bpm": {"$lte": 100}})
         if current_intent.get("year"):
             try: filter_list.append({"year": int(current_intent["year"])})
             except: pass
+        elif current_intent.get("era"):
+            filter_list.append({"era": current_intent["era"]})
+            
+        if current_intent.get("mood"):
+            filter_list.append({"mood": current_intent["mood"]})
+        if current_intent.get("genre_fixed"):
+            filter_list.append({"genre_fixed": current_intent["genre_fixed"]})
+        if current_intent.get("is_instrumental"):
+            filter_list.append({"is_instrumental": current_intent["is_instrumental"]})
+        if current_intent.get("directory"):
+            filter_list.append({"path": {"$contains": current_intent["directory"]}})
+
+        if not filter_list: return None
+        return {"$and": filter_list} if len(filter_list) > 1 else filter_list[0]
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # [2단계] 임베딩 생성 및 벡터 검색 (의미 기반)
+    # ═════════════════════════════════════════════════════════════════════════
+    # 벡터 검색에 방해되는 시스템 변수(True/False, 숫자 등)는 제외하고 순수 검색어만 뭉침
+    ignore_keys = ['count', 'is_instrumental', 'directory', 'era', 'year']
+    search_terms = [str(v) for k, v in intent.items() if v and k not in ignore_keys]
+    
+    # 추출된 검색어가 없으면 일반 키워드 사용
+    query_text = " ".join(search_terms) if search_terms else (intent.get("keyword") or "음악")
+    logger.info(f"🧠 벡터 임베딩 텍스트: {query_text}")
+    
+    embed_resp = ollama.embeddings(model=EMBED_MODEL, prompt=query_text)
+    query_embed = embed_resp.get("embedding") if isinstance(embed_resp, dict) else embed_resp.embedding
+
+    def _do_query(n: int, where_c=None):
+        try:
+            return collection.query(query_embeddings=[query_embed], n_results=safe_n(n), where=where_c)
+        except Exception as e:
+            logger.error(f"쿼리 오류로 필터 없이 재시도: {e}")
+            return collection.query(query_embeddings=[query_embed], n_results=safe_n(n))
+
+    def _unpack(res): return res.get("ids", [[]])[0], res.get("metadatas", [[]])[0]
+
+    logger.info("[1단계] 필터 적용 벡터 검색")
+    ids, metas = _unpack(_do_query(40, _build_where(intent)))
+
+    if not ids:
+        logger.info("[2단계] 순수 벡터 검색 (필터 해제)")
+        ids, metas = _unpack(_do_query(target_count, None))
+
+    if not ids: return [], []
+
+    # 랜덤 샘플링 (매번 똑같은 곡만 나오는 것 방지)
+    combined = list(zip(ids, metas))
+    sampled = random.sample(combined, min(len(combined), target_count))
+    ids_out, meta_out = zip(*sampled)
+    
+    return list(ids_out), list(meta_out)
+
+    # [1단계] 필터 생성 및 벡터 검색 준비
+    def _build_where(current_intent):
+        filter_list = []
         
-        if current_intent.get("era") and not current_intent.get("year"):
-            nums = re.sub(r'[^0-9]', '', str(current_intent["era"]))
-            if nums:
-                decade = int(nums)
-                start = (1900 + decade if decade >= 50 else 2000 + decade) if decade < 100 else decade
-                filter_list.append({"year": {"$gte": start, "$lte": start + 9}})
+        # 1. 연도 필터 (Integer)
+        if current_intent.get("year"):
+            try: filter_list.append({"year": int(current_intent["year"])})
+            except: pass
+            
+        # 2. 연대 필터 (String - DB에 "1990년대" 형태로 저장되어 있으므로 직접 매칭)
+        elif current_intent.get("era"):
+            filter_list.append({"era": current_intent["era"]})
+            
+        # 3. 분위기 필터 (String)
+        if current_intent.get("mood"):
+            filter_list.append({"mood": current_intent["mood"]})
+            
+        # 4. 장르 필터 (String)
+        if current_intent.get("genre_fixed"):
+            filter_list.append({"genre_fixed": current_intent["genre_fixed"]})
+            
+        # 5. 연주곡 필터 (String "True" / "False")
+        if current_intent.get("is_instrumental"):
+            filter_list.append({"is_instrumental": current_intent["is_instrumental"]})
+
+        # 기존 _build_where 함수 내부에 아래 3줄을 추가
+        if current_intent.get("directory"):
+            # 경로 문자열 어딘가에 해당 디렉토리명이 포함되어 있는지 검사
+            filter_list.append({"path": {"$contains": current_intent["directory"]}})
 
         if not filter_list: return None
         return {"$and": filter_list} if len(filter_list) > 1 else filter_list[0]
