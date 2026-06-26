@@ -18,6 +18,6 @@ tar -czf "$BACKUP_DIR/$BACKUP_NAME" \
     app/bot_data.db
 
 # 4. 오래된 백업 삭제 (최근 7일분만 유지)
-#find "$BACKUP_DIR" -name "db_backup_*.tar.gz" -mtime +7 -delete
+find "$BACKUP_DIR" -name "db_backup_*.tar.gz" -mtime +7 -delete
 
 echo "[$TIMESTAMP] 백업 완료: $BACKUP_NAME"
