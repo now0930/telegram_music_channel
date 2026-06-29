@@ -50,7 +50,9 @@ music_tools = [
                         'type': 'string',
                         'description': '음악이 저장된 폴더나 위치. 사용자가 "A에서 B"라고 말하면 A는 무조건 directory입니다. 멜론, 벅스, 유튜브 같은 스트리밍 앱 이름이 언급되어도 이를 무조건 로컬 폴더(directory) 이름으로 취급하세요. "~에서", "~폴더" 같은 조사는 제외하고 명사만 추출하세요. (예: "멜론에서 아이유" -> directory: "멜론", "방탄 폴더에서" -> directory: "방탄")'
                     }
-                }
+                },
+                # ✅ 핵심 수정: required 추가
+                'required': ['count', 'keyword']
             }
         }
     }

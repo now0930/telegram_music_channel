@@ -356,6 +356,30 @@ def normalize_intent(intent: dict, user_query: str) -> dict:
     if not fixed.get("keyword"):
         fixed["keyword"] = cleaned_keyword or user_query
 
+    _KEYWORD_TO_DIR = {
+        "melontop":     "melon_top100",
+        "melontop100":  "melon_top100",
+        "melon_top100": "melon_top100",
+        "melon":        "melon_top100",
+        "멜론":         "melon_top100",
+        "멜론탑":       "melon_top100",
+        "멜론차트":     "melon_top100",
+        "탑100":        "melon_top100",
+        "top100":       "melon_top100",
+        "최신곡":       "melon_top100",
+        "인기곡":       "melon_top100",
+    }
+
+    if not fixed.get("directory"):
+        for field in ["keyword", "artist", "title"]:
+            val = fixed.get(field, "").replace(" ", "").lower()
+            if val in _KEYWORD_TO_DIR:
+                fixed["directory"] = _KEYWORD_TO_DIR[val]
+                fixed.pop(field, None)  # keyword 오염 제거
+                logger.info(f"📁 '{val}' → directory: '{fixed['directory']}' 강제 매핑")
+                break
+
+
     # 빈 값 제거
     cleaned = {}
 
@@ -464,6 +488,48 @@ def _extract_intent_sync(user_query: str) -> dict:
 
     except Exception as e:
         logger.error(f"❌ 에이전트 실행 실패: {e}")
+
+    # ── ✅ Function Calling 실패 시: 직접 JSON 프롬프트로 재시도 ──
+    logger.warning("⚠️ Function Calling 실패. JSON 직접 추출 모드로 전환...")
+
+    try:
+        json_response = ollama.chat(
+            model=TEXT_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a JSON extractor. "
+                        "Output ONLY a single JSON object. No text before or after. "
+                        "Extract search conditions from the user query."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f'Extract from: "{user_query}"\n\n'
+                        f'Output format (JSON only):\n'
+                        f'{{"artist":"","title":"","keyword":"{user_query}","year":null,'
+                        f'"era":"","mood":"","genre_fixed":"","is_instrumental":"",'
+                        f'"count":5,"directory":""}}'
+                    ),
+                },
+            ],
+            options={"temperature": 0},
+        )
+
+        text = json_response.message.content or ""
+        match = re.search(r"\{.*?\}", text, re.DOTALL)
+
+        if match:
+            parsed = json.loads(match.group())
+            logger.info(f"✅ JSON 직접 추출 성공: {parsed}")
+            return parsed
+
+    except Exception as e:
+        logger.error(f"❌ JSON 직접 추출도 실패: {e}")
+
+    # ── 최종 폴백 ──
 
     # 최종 실패 시 폴백
     return {
