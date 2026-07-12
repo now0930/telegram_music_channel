@@ -22,6 +22,7 @@ services:
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
       - MUSIC_CHANNEL_ID=${MUSIC_CHANNEL_ID}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - OLLAMA_MODEL=qwen3.5:9b          # ← 추가! (Function Calling 안정적)
 
     networks:
       - ollama_network
