@@ -31,13 +31,11 @@ from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTyp
 from agent_tools import music_tools
 from artist_aliases import ARTIST_ALIASES
 
-
 # 최신 구글 생성형 AI 라이브러리
 try:
     from google import genai
 except ImportError:
     genai = None
-
 
 # ═════════════════════════════════════════════════════════════════════════════════════
 #  📋 로깅 설정
@@ -49,7 +47,6 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("music_bot")
-
 
 # ═════════════════════════════════════════════════════════════════════════════════════
 #  ⚙️ 설정
@@ -77,7 +74,6 @@ if not TELEGRAM_TOKEN:
 
 GEMINI_MODEL_NAME = "gemini-3.1-flash-lite-preview"
 
-
 # Gemini 초기화
 client_gemini = None
 
@@ -94,7 +90,6 @@ if False:
 else:
     logger.warning("⚠️ GEMINI_API_KEY가 없거나 라이브러리가 설치되지 않아 Ollama 단독 모드로 동작합니다.")
 
-
 # ═════════════════════════════════════════════════════════════════════════════════════
 #  🗄️ ChromaDB 연결
 # ═════════════════════════════════════════════════════════════════════════════════════
@@ -105,7 +100,6 @@ except ChromaInternalError as e:
     logger.error("ChromaDB 컬렉션 로드 중 에러 발생. 재구성을 시도합니다: %s", e)
     _chroma.delete_collection("music_library")
     collection = _chroma.get_or_create_collection(name="music_library")
-
 
 # ═════════════════════════════════════════════════════════════════════════════════════
 #  🛠️ 유틸리티
@@ -118,7 +112,6 @@ async def init_db():
                 last_active REAL
             )
         """)
-
         await db.execute("""
             CREATE TABLE IF NOT EXISTS sent_messages (
                 rowid INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -127,9 +120,7 @@ async def init_db():
                 sent_at REAL
             )
         """)
-
         await db.commit()
-
 
 async def update_user_access(chat_id: int):
     async with aiosqlite.connect(BOT_DB_PATH) as db:
@@ -137,7 +128,6 @@ async def update_user_access(chat_id: int):
             "INSERT OR REPLACE INTO users (chat_id, last_active) VALUES (?, ?)",
             (chat_id, time.time()),
         )
-
         cursor = await db.execute(
             """
             SELECT chat_id
@@ -151,26 +141,19 @@ async def update_user_access(chat_id: int):
             """,
             (MAX_USERS,),
         )
-
         evicted_users = await cursor.fetchall()
-
         for row in evicted_users:
             await db.execute("DELETE FROM sent_messages WHERE chat_id = ?", (row[0],))
             await db.execute("DELETE FROM users WHERE chat_id = ?", (row[0],))
-
         await db.commit()
-
 
 async def ttl_cleanup_task(application):
     await asyncio.sleep(10)
-
     while True:
         try:
             cutoff_time = time.time() - TTL_SECONDS
-
             async with aiosqlite.connect(BOT_DB_PATH) as db:
                 db.row_factory = aiosqlite.Row
-
                 cursor = await db.execute(
                     """
                     SELECT rowid, chat_id, message_id
@@ -179,9 +162,7 @@ async def ttl_cleanup_task(application):
                     """,
                     (cutoff_time,),
                 )
-
                 rows = await cursor.fetchall()
-
                 for row in rows:
                     try:
                         await application.bot.delete_message(
@@ -190,19 +171,14 @@ async def ttl_cleanup_task(application):
                         )
                     except Exception:
                         pass
-
                     await db.execute(
                         "DELETE FROM sent_messages WHERE rowid = ?",
                         (row["rowid"],),
                     )
-
                 await db.commit()
-
         except Exception as e:
             logger.error("TTL 정리 루프 에러: %s", e)
-
         await asyncio.sleep(3600)
-
 
 async def safe_edit(message, text: str) -> None:
     try:
@@ -210,189 +186,119 @@ async def safe_edit(message, text: str) -> None:
     except Exception:
         pass
 
-
 def truncate_caption(text: str, limit: int = CAPTION_LIMIT) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
-
 
 def _to_text(value) -> str:
     if value is None:
         return ""
-
     if isinstance(value, list):
         return " ".join(str(v).strip() for v in value if str(v).strip())
-
     return str(value).strip()
-
 
 def _to_int(value, default=None):
     if value is None:
         return default
-
     try:
         return int(value)
     except Exception:
         pass
-
     match = re.search(r"-?\d+", str(value))
-
     if match:
         try:
             return int(match.group())
         except Exception:
             return default
-
     return default
-
 
 def _extract_count_from_query(user_query: str, default=5) -> int:
     match = re.search(r"(\d+)\s*(개|곡|개만|곡만)", user_query)
-
     if match:
         return int(match.group(1))
-
     return default
 
-
 def _clean_keyword_from_query(user_query: str) -> str:
-    """
-    '한로로 노래 10개' -> '한로로'
-    '봄날 노래 5개' -> '봄날'
-    '악동 뮤직션 노래 3개' -> '악동 뮤직션'
-
-    여기서는 가수/제목을 단정하지 않고 keyword만 만든다.
-    """
     text = user_query.strip()
-
-    # 연도 제거
     text = re.sub(r"(19\d{2}|20\d{2})\s*년(?:도)?", " ", text)
-
-    # 개수 제거
     text = re.sub(r"\d+\s*(개|곡|개만|곡만)", " ", text)
-
-    # 검색 명령어 제거
     remove_words = [
-        "노래",
-        "곡",
-        "음악",
-        "들려줘",
-        "찾아줘",
-        "검색",
-        "추천",
-        "추천해줘",
-        "틀어줘",
-        "보내줘",
-        "좀",
-        "만",
+        "노래", "곡", "음악", "들려줘", "찾아줘", "검색", "추천", "추천해줘", "틀어줘", "보내줘", "좀", "만",
     ]
-
     for word in remove_words:
         text = text.replace(word, " ")
-
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
-
 def normalize_intent(intent: dict, user_query: str) -> dict:
-    """
-    agent_tools.py의 search_local_music 스키마에 맞춘 최소 보정.
-
-    사용 필드:
-      title, artist, year, era, mood, genre_fixed,
-      is_instrumental, count, keyword, directory
-
-    원칙:
-      - artist/title을 억지로 추론하지 않는다.
-      - 애매한 입력은 keyword에만 넣는다.
-      - Hermes가 artist/title을 틀려도 원문 keyword를 항상 보조로 넣는다.
-      - year <= 0 제거
-      - is_instrumental == "False" 제거
-    """
     if not isinstance(intent, dict):
         intent = {}
-
     fixed = dict(intent)
 
-    # 문자열 필드 정리
     for key in [
-        "title",
-        "artist",
-        "era",
-        "mood",
-        "genre_fixed",
-        "is_instrumental",
-        "keyword",
-        "directory",
+        "title", "artist", "era", "mood", "genre_fixed", "is_instrumental", "keyword", "directory",
     ]:
         if key in fixed:
             fixed[key] = _to_text(fixed.get(key))
 
-    # count 보정
     count = _to_int(fixed.get("count"), default=None)
-
     if not count or count <= 0:
         count = _extract_count_from_query(user_query, default=5)
-
     fixed["count"] = count
 
-    # year 보정: -1, 0은 제거
     year = _to_int(fixed.get("year"), default=None)
-
     if year and year > 0:
         fixed["year"] = year
     else:
         fixed.pop("year", None)
 
-    # is_instrumental 보정
-    # agent_tools.py enum 때문에 "False"가 들어올 수 있는데,
-    # False는 검색 필터로 쓰지 않는다.
     if fixed.get("is_instrumental") != "True":
         fixed.pop("is_instrumental", None)
 
-    # 사용자 원문에서 만든 keyword를 항상 보조 검색어로 확보한다.
-    # Hermes가 artist/title을 잘못 뽑아도 원문 검색어가 살아있게 하기 위함.
     cleaned_keyword = _clean_keyword_from_query(user_query)
-
-    if not fixed.get("keyword"):
-        fixed["keyword"] = cleaned_keyword or user_query
-
+    
     _KEYWORD_TO_DIR = {
         "melontop":     "melon_top100",
         "melontop100":  "melon_top100",
         "melon_top100": "melon_top100",
         "melon":        "melon_top100",
-        "멜론":         "melon_top100",
-        "멜론탑":       "melon_top100",
-        "멜론차트":     "melon_top100",
+        "멜론":          "melon_top100",
+        "멜론탑":        "melon_top100",
+        "멜론차트":      "melon_top100",
         "탑100":        "melon_top100",
         "top100":       "melon_top100",
-        "최신곡":       "melon_top100",
-        "인기곡":       "melon_top100",
+        "최신곡":        "melon_top100",
+        "인기곡":        "melon_top100",
     }
 
+    # 💡 [수정 포인트 1] LLM이 이미 directory를 찾았더라도 매핑 테이블을 거치게 강제
+    current_dir = fixed.get("directory", "").replace(" ", "").lower()
+    if current_dir in _KEYWORD_TO_DIR:
+        fixed["directory"] = _KEYWORD_TO_DIR[current_dir]
+
+    # LLM이 directory를 못 찾았을 경우 keyword 등에서 유추
     if not fixed.get("directory"):
         for field in ["keyword", "artist", "title"]:
             val = fixed.get(field, "").replace(" ", "").lower()
             if val in _KEYWORD_TO_DIR:
                 fixed["directory"] = _KEYWORD_TO_DIR[val]
-                fixed.pop(field, None)  # keyword 오염 제거
+                fixed.pop(field, None)
                 logger.info(f"📁 '{val}' → directory: '{fixed['directory']}' 강제 매핑")
                 break
 
+    # 💡 [수정 포인트 2] 폴더나 가수가 명확히 지정되었으면 '멜롬 5' 같은 오타성 키워드는 제거
+    if not fixed.get("keyword"):
+        # 다른 조건이 아예 없을 때만 원문을 키워드로 사용
+        if not fixed.get("directory") and not fixed.get("artist") and not fixed.get("title"):
+            fixed["keyword"] = cleaned_keyword or user_query
+    else:
+        # 만약 디렉토리가 확실한데 keyword에 쓸데없는 오타가 들어있다면 제거
+        if fixed.get("directory") and fixed.get("keyword") == user_query:
+            fixed.pop("keyword", None)
 
-    # 빈 값 제거
     cleaned = {}
-
     for key, value in fixed.items():
-        if value is None:
+        if value is None or value == "" or value == []:
             continue
-
-        if value == "":
-            continue
-
-        if value == []:
-            continue
-
         cleaned[key] = value
 
     logger.info(f"🧩 보정된 intent: {cleaned}")
@@ -428,25 +334,19 @@ def _extract_intent_sync(user_query: str) -> dict:
         f"}}"
     )
 
-    # 1. Gemini 우선 시도
     if client_gemini:
         try:
             logger.info(f"✨ {GEMINI_MODEL_NAME} 엔진으로 의도 분석 중...")
-
             response = client_gemini.models.generate_content(
                 model=GEMINI_MODEL_NAME,
                 contents=intent_prompt,
             )
-
             match = re.search(r"\{.*?\}", response.text, re.DOTALL)
-
             if match:
                 return json.loads(match.group())
-
         except Exception as e:
             logger.warning(f"⚠️ Gemini 오류 발생, Ollama({TEXT_MODEL})로 전환: {e}")
 
-    # 2. Hermes 에이전트를 통한 Function Calling
     try:
         response = ollama.chat(
             model=TEXT_MODEL,
@@ -481,7 +381,6 @@ def _extract_intent_sync(user_query: str) -> dict:
             if function_name == "search_local_music":
                 if "count" not in arguments or not arguments["count"]:
                     arguments["count"] = 5
-
                 return arguments
 
         logger.warning(f"⚠️ 에이전트가 도구를 무시함. 모델의 텍스트 대답: {response.message.content}")
@@ -489,7 +388,6 @@ def _extract_intent_sync(user_query: str) -> dict:
     except Exception as e:
         logger.error(f"❌ 에이전트 실행 실패: {e}")
 
-    # ── ✅ Function Calling 실패 시: 직접 JSON 프롬프트로 재시도 ──
     logger.warning("⚠️ Function Calling 실패. JSON 직접 추출 모드로 전환...")
 
     try:
@@ -529,19 +427,14 @@ def _extract_intent_sync(user_query: str) -> dict:
     except Exception as e:
         logger.error(f"❌ JSON 직접 추출도 실패: {e}")
 
-    # ── 최종 폴백 ──
-
-    # 최종 실패 시 폴백
     return {
         "keyword": user_query,
         "count": _extract_count_from_query(user_query, default=5),
     }
 
-
 async def extract_intent(user_query: str) -> dict:
     raw_intent = await asyncio.to_thread(_extract_intent_sync, user_query)
     return normalize_intent(raw_intent, user_query)
-
 
 # ═════════════════════════════════════════════════════════════════════════════════════
 #  🔍 벡터 검색
@@ -560,35 +453,22 @@ def _search_music_sync(intent: dict) -> tuple[list[str], list[dict]]:
         return _to_text(text).replace(" ", "").lower()
 
     def _loose_match(keyword: str, candidates: list[str]) -> bool:
-        """
-        약한 오타 허용 매칭.
-
-        예:
-          악동뮤직션 ≈ 악동뮤지션
-
-        너무 짧은 단어는 오탐이 많으므로 fuzzy를 적용하지 않는다.
-        """
         keyword = _clean_for_match(keyword)
-
         if not keyword:
             return False
 
         for candidate in candidates:
             candidate = _clean_for_match(candidate)
-
             if not candidate:
                 continue
 
-            # 완전 포함 매칭
             if keyword in candidate or candidate in keyword:
                 return True
 
-            # 너무 짧은 단어는 fuzzy 금지
             if len(keyword) < 4 or len(candidate) < 4:
                 continue
 
             score = SequenceMatcher(None, keyword, candidate).ratio()
-
             if score >= 0.78:
                 return True
 
@@ -602,8 +482,6 @@ def _search_music_sync(intent: dict) -> tuple[list[str], list[dict]]:
     search_dir_clean = raw_dir.replace(" ", "").lower() if raw_dir else ""
     target_dirs = ARTIST_ALIASES.get(search_dir_clean, [search_dir_clean]) if search_dir_clean else []
 
-    # title / artist / keyword 중 하나만 고르지 않고 모두 검색 후보로 사용한다.
-    # Hermes가 artist를 잘못 뽑아도 원문 keyword 후보가 살아있게 한다.
     raw_keywords = [
         _to_text(intent.get("title")),
         _to_text(intent.get("artist")),
@@ -614,18 +492,12 @@ def _search_music_sync(intent: dict) -> tuple[list[str], list[dict]]:
 
     for kw in raw_keywords:
         kw_clean = _clean_for_match(kw)
-
         if not kw_clean:
             continue
-
         if kw_clean not in search_keywords:
             search_keywords.append(kw_clean)
-
-        # artist_aliases.py는 정상 동의어 확장용으로만 사용한다.
-        # 오타형 alias는 추가하지 않는다.
         for alias in ARTIST_ALIASES.get(kw_clean, []):
             alias_clean = _clean_for_match(alias)
-
             if alias_clean and alias_clean not in search_keywords:
                 search_keywords.append(alias_clean)
 
@@ -640,21 +512,15 @@ def _search_music_sync(intent: dict) -> tuple[list[str], list[dict]]:
             title = _to_text(meta.get("title"))
             artist = _to_text(meta.get("artist"))
             path = _to_text(meta.get("path"))
-
             path_clean = _clean_for_match(path)
 
             is_match = False
 
-            # 1. 폴더 조건
             if target_dirs:
                 dir_matched = any(d in path_clean for d in target_dirs if d)
-
                 if not dir_matched:
                     continue
 
-            # 2. 키워드 조건
-            # keyword는 title / artist / path 후보에 대해 검색한다.
-            # 정확히 포함되지 않아도 약간의 오타는 허용한다.
             if not search_keywords:
                 is_match = True
             else:
@@ -663,61 +529,51 @@ def _search_music_sync(intent: dict) -> tuple[list[str], list[dict]]:
                     for part in path.replace("\\", "/").split("/")
                     if part.strip()
                 ]
-
                 candidates = [
                     title,
                     artist,
                     path,
                     *path_parts,
                 ]
-
                 if any(_loose_match(kw, candidates) for kw in search_keywords):
                     is_match = True
 
             if is_match:
                 match_ids.append(all_data["ids"][i])
                 match_metas.append(meta)
-
         if match_ids:
             logger.info(f"✅ 직접 매칭 성공! {len(match_ids)}곡 발견")
-            return match_ids[:target_count], match_metas[:target_count]
+            # 매번 같은 곡만 나오지 않도록 무작위 셔플 후 추출
+            combined_match = list(zip(match_ids, match_metas))
+            sampled_match = random.sample(combined_match, min(len(combined_match), target_count))
+            
+            ids_out, meta_out = zip(*sampled_match)
+            return list(ids_out), list(meta_out)
 
     # ═════════════════════════════════════════════════════════════════════════
-    # [1단계] ChromaDB 메타데이터 필터 생성
+    # [1단계] ChromaDB 메타데이터 필터 생성 (수정본)
     # ═════════════════════════════════════════════════════════════════════════
     def _build_where(current_intent):
         filter_list = []
 
-        # year
         if current_intent.get("year"):
             try:
                 year = int(current_intent["year"])
-
                 if year > 0:
                     filter_list.append({"year": year})
-
             except Exception:
                 pass
-
-        # era
         elif current_intent.get("era"):
             filter_list.append({"era": current_intent["era"]})
 
-        # mood
         if current_intent.get("mood"):
             filter_list.append({"mood": current_intent["mood"]})
 
-        # genre_fixed
         if current_intent.get("genre_fixed"):
             filter_list.append({"genre_fixed": current_intent["genre_fixed"]})
 
-        # is_instrumental
         if current_intent.get("is_instrumental") == "True":
             filter_list.append({"is_instrumental": "True"})
-
-        # directory/path
-        if current_intent.get("directory"):
-            filter_list.append({"path": {"$contains": current_intent["directory"]}})
 
         if not filter_list:
             return None
@@ -727,35 +583,21 @@ def _search_music_sync(intent: dict) -> tuple[list[str], list[dict]]:
     # ═════════════════════════════════════════════════════════════════════════
     # [2단계] 임베딩 생성 및 벡터 검색
     # ═════════════════════════════════════════════════════════════════════════
-    ignore_keys = [
-        "count",
-        "is_instrumental",
-        "directory",
-        "era",
-        "year",
-    ]
-
+    ignore_keys = ["count", "is_instrumental", "directory", "era", "year"]
     search_terms = []
 
     for key, value in intent.items():
-        if not value:
+        if not value or key in ignore_keys:
             continue
-
-        if key in ignore_keys:
-            continue
-
         text = _to_text(value)
-
         if text:
             search_terms.append(text)
 
     query_text = " ".join(search_terms).strip()
-
     if not query_text:
         query_text = intent.get("keyword") or "음악"
 
     logger.info(f"🧠 벡터 임베딩 텍스트: {query_text}")
-
     embed_resp = ollama.embeddings(model=EMBED_MODEL, prompt=query_text)
 
     query_embed = (
@@ -772,15 +614,12 @@ def _search_music_sync(intent: dict) -> tuple[list[str], list[dict]]:
                     n_results=safe_n(n),
                     where=where_c,
                 )
-
             return collection.query(
                 query_embeddings=[query_embed],
                 n_results=safe_n(n),
             )
-
         except Exception as e:
             logger.error(f"쿼리 오류로 필터 없이 재시도: {e}")
-
             return collection.query(
                 query_embeddings=[query_embed],
                 n_results=safe_n(n),
@@ -791,6 +630,21 @@ def _search_music_sync(intent: dict) -> tuple[list[str], list[dict]]:
 
     logger.info("[1단계] 필터 적용 벡터 검색")
     ids, metas = _unpack(_do_query(40, _build_where(intent)))
+
+    # 💡 [핵심 수정] 파이썬 메모리 단에서 디렉토리 경로 조건 강제 필터링
+    if ids and intent.get("directory"):
+        target_dir = intent["directory"].lower()
+        filtered_combined = [
+            (idx, meta) for idx, meta in zip(ids, metas)
+            if target_dir in _to_text(meta.get("path")).lower()
+        ]
+        
+        if filtered_combined:
+            ids, metas = zip(*filtered_combined)
+            ids, metas = list(ids), list(metas)
+        else:
+            # 매칭되는 폴더 곡이 하나도 없으면 2단계 전체 검색으로 넘어가기 위해 초기화
+            ids, metas = [], []
 
     if not ids:
         logger.info("[2단계] 순수 벡터 검색 (필터 해제)")
@@ -804,13 +658,10 @@ def _search_music_sync(intent: dict) -> tuple[list[str], list[dict]]:
     sampled = random.sample(combined, min(len(combined), target_count))
 
     ids_out, meta_out = zip(*sampled)
-
     return list(ids_out), list(meta_out)
-
 
 async def search_music(intent: dict) -> tuple[list[str], list[dict]]:
     return await asyncio.to_thread(_search_music_sync, intent)
-
 
 # ═════════════════════════════════════════════════════════════════════════════════════
 #  📨 텔레그램 전송 및 핸들러
@@ -848,7 +699,6 @@ async def send_music_files(context, chat_id, update, file_paths, metadatas, user
                     """,
                     (chat_id, msg.message_id, time.time()),
                 )
-
                 await db.commit()
 
             if i < total:
@@ -858,7 +708,6 @@ async def send_music_files(context, chat_id, update, file_paths, metadatas, user
             logger.error("전송 실패: %s", e)
 
     return success
-
 
 async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
@@ -905,14 +754,12 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         logger.exception("에러: %s", e)
         await safe_edit(status_msg, "❌ 처리 중 오류가 발생했습니다.")
 
-
 # ═════════════════════════════════════════════════════════════════════════════════════
 #  🚀 진입점
 # ═════════════════════════════════════════════════════════════════════════════════════
 async def post_init(application):
     await init_db()
     asyncio.create_task(ttl_cleanup_task(application))
-
 
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
