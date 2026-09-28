@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sqlite3
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
@@ -88,6 +89,25 @@ def parse_schedule():
     return [("오전", morning), ("오후", afternoon)]
 
 
+def directory_key(name):
+    return re.sub(r"[\s_-]+", "", name).casefold()
+
+
+def track_group(path):
+    target = directory_key(os.getenv("RECOMMEND_MELON_DIRECTORY", "melon_top100"))
+    return "melon" if any(directory_key(part) == target for part in Path(path).parts[:-1]) else "other"
+
+
+def read_quotas():
+    quotas = {"melon": int(os.getenv("RECOMMEND_MELON_COUNT", "20")),
+              "other": int(os.getenv("RECOMMEND_OTHER_COUNT", "10"))}
+    if any(n < 0 for n in quotas.values()) or not 1 <= sum(quotas.values()) <= 100:
+        raise ValueError("Recommendation counts must be nonnegative and total between 1 and 100")
+    if not directory_key(os.getenv("RECOMMEND_MELON_DIRECTORY", "melon_top100")):
+        raise ValueError("RECOMMEND_MELON_DIRECTORY must not be empty")
+    return quotas
+
+
 class DailyMusic:
     def __init__(self, application, collection, db_path, embed_model, host):
         import ollama
@@ -98,6 +118,8 @@ class DailyMusic:
         self.channel = int(channel) if channel.lstrip("-").isdigit() else channel
         self.timezone = ZoneInfo(os.getenv("RECOMMEND_TIMEZONE", "Asia/Seoul"))
         self.schedule = parse_schedule()
+        self.quotas = read_quotas()
+        self.total = sum(self.quotas.values())
         self.lock = asyncio.Lock()
         self.db_path = db_path
         with self.db() as db:
@@ -119,7 +141,7 @@ class DailyMusic:
             log.error("Music library is empty; check MUSIC_DB_PATH and Docker mounts")
             return []
         embedding = self.client.embeddings(model=self.embed_model, prompt=query).embedding
-        result = self.collection.query(query_embeddings=[embedding], n_results=min(count, 200))
+        result = self.collection.query(query_embeddings=[embedding], n_results=count, include=["metadatas"])
         return [(meta.get("path") or ident, meta) for ident, meta in
                 zip(result["ids"][0], result["metadatas"][0]) if meta]
 
@@ -139,8 +161,10 @@ class DailyMusic:
                 rows = db.execute("SELECT path, slot, state FROM daily_deliveries WHERE channel=? AND day=?",
                                   (str(self.channel), day)).fetchall()
             used = {row[0] for row in rows}
-            completed = sum(row[1] == slot for row in rows)
-            if completed >= 10:
+            counts = {group: sum(row[1] == slot and track_group(row[0]) == group for row in rows)
+                      for group in self.quotas}
+            completed = sum(counts.values())
+            if all(counts[group] >= quota for group, quota in self.quotas.items()):
                 return
             try:
                 # Validate the destination before reserving tracks or querying Mica.
@@ -161,8 +185,11 @@ class DailyMusic:
                     music_root = Path(os.getenv("MUSIC_PATH", "/music")).resolve()
                     if path in used or not Path(path).is_relative_to(music_root) or not Path(path).is_file():
                         continue
-                    if completed >= 10:
+                    if all(counts[group] >= quota for group, quota in self.quotas.items()):
                         break
+                    group = track_group(path)
+                    if counts[group] >= self.quotas[group]:
+                        continue
                     # Reserve before sending: ambiguous timeouts/crashes must not resend audio.
                     with self.db() as db:
                         inserted = db.execute("INSERT OR IGNORE INTO daily_deliveries VALUES (?, ?, ?, ?, 'pending')",
@@ -171,10 +198,11 @@ class DailyMusic:
                         continue
                     used.add(path)
                     completed += 1
+                    counts[group] += 1
                     try:
                         with open(path, "rb") as audio:
                             await context.bot.send_audio(chat_id=self.channel, audio=audio,
-                                caption=(f"🎵 {day} {slot} 추천 {completed}/10\n"
+                                caption=(f"🎵 {day} {slot} 추천 {completed}/{self.total}\n"
                                     f"{meta.get('artist', '')} - {meta.get('title', '')}\n{query}")[:1024],
                                 write_timeout=120, read_timeout=120, connect_timeout=30)
                         with self.db() as db:
@@ -190,8 +218,10 @@ class DailyMusic:
                     except Exception:
                         log.exception("Delivery outcome uncertain; reserved track will not be retried: %s", path)
                     await asyncio.sleep(2)
-                if completed < 10:
-                    log.warning("%s %s: only %d/10 tracks available", day, slot, completed)
+                for group, quota in self.quotas.items():
+                    if counts[group] < quota:
+                        log.warning("%s %s: %s only %d/%d tracks available; no cross-directory substitution",
+                                    day, slot, group, counts[group], quota)
             except Exception:
                 log.exception("Scheduled recommendation failed")
 
@@ -207,3 +237,4 @@ def install(application, collection, db_path, embed_model, host):
     application.job_queue.run_repeating(runner.tick, interval=300, first=5,
                                        job_kwargs={"max_instances": 1, "coalesce": True})
     log.info("Daily recommendations enabled: %s (%s)", runner.schedule, runner.timezone)
+    log.info("Per batch quotas: melon=%d other=%d", runner.quotas["melon"], runner.quotas["other"])

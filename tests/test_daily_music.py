@@ -12,6 +12,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 import daily_music as dm
 
 class ContextTests(unittest.TestCase):
+    @patch.dict(os.environ, {"RECOMMEND_MELON_COUNT": "5", "RECOMMEND_OTHER_COUNT": "15"})
+    def test_custom_counts(self):
+        self.assertEqual(dm.read_quotas(), {"melon": 5, "other": 15})
+
+    @patch.dict(os.environ, {"RECOMMEND_MELON_COUNT": "-1"})
+    def test_negative_counts_rejected(self):
+        with self.assertRaises(ValueError):
+            dm.read_quotas()
+
+    def test_directory_matching(self):
+        for name in ("melon top 100", "melon_top100", "Melon-Top-100"):
+            self.assertEqual(dm.track_group("/music/" + name + "/album/song.mp3"), "melon")
+        self.assertEqual(dm.track_group("/music/not_melon_top100/song.mp3"), "other")
+        self.assertEqual(dm.track_group("/music/other/melon_top100.mp3"), "other")
+
     def test_weekday_regions(self):
         now = datetime(2026, 9, 28)
         self.assertEqual([x[0] for x in dm.locations_for(now, "오전")], ["군포", "광명"])
@@ -40,16 +55,18 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(result["market"], {"unavailable": True})
 
 class DeliveryTests(unittest.IsolatedAsyncioTestCase):
-    async def test_restart_no_duplicates_and_afternoon_ten_new_tracks(self):
+    async def test_restart_no_duplicates_and_twenty_ten_per_batch(self):
         with tempfile.TemporaryDirectory() as tmp:
             tracks = []
-            for i in range(25):
-                p = Path(tmp) / f"{i}.mp3"
+            for i in range(75):
+                p = Path(tmp) / ("melon top 100" if i < 50 else "other") / f"{i}.mp3"
+                p.parent.mkdir(exist_ok=True)
                 p.write_bytes(b"test")
                 tracks.append((str(p), {"title": str(i)}))
             bot = SimpleNamespace(send_audio=AsyncMock(), get_chat=AsyncMock())
             context = SimpleNamespace(bot=bot)
-            with patch.dict(os.environ, {"MUSIC_CHANNEL_ID": "-100123", "MUSIC_PATH": tmp}), \
+            with patch.dict(os.environ, {"MUSIC_CHANNEL_ID": "-100123", "MUSIC_PATH": tmp, "RECOMMEND_MELON_COUNT": "20",
+                                        "RECOMMEND_OTHER_COUNT": "10", "RECOMMEND_MELON_DIRECTORY": "melon_top100"}), \
                  patch.dict(sys.modules, {"ollama": SimpleNamespace(Client=Mock()),
                      "telegram.error": SimpleNamespace(BadRequest=type("BadRequest", (Exception,), {}),
                          Forbidden=type("Forbidden", (Exception,), {}), RetryAfter=type("RetryAfter", (Exception,), {}))}), \
@@ -73,17 +90,28 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(db.execute("SELECT count(*) FROM daily_deliveries").fetchone()[0], 0)
                 bot.send_audio.reset_mock(side_effect=True)
                 await runner().tick(context)
-                self.assertEqual(bot.send_audio.await_count, 10)
+                self.assertEqual(bot.send_audio.await_count, 30)
                 await runner().tick(context)
-                self.assertEqual(bot.send_audio.await_count, 10)
+                self.assertEqual(bot.send_audio.await_count, 30)
                 clock.now.return_value = datetime(2026, 9, 28, 15, 0)
                 await runner().tick(context)
-                self.assertEqual(bot.send_audio.await_count, 20)
+                self.assertEqual(bot.send_audio.await_count, 60)
                 names = [c.kwargs["audio"].name for c in bot.send_audio.await_args_list]
-                self.assertEqual(len(set(names)), 20)
+                self.assertEqual(len(set(names)), 60)
+                for batch in (names[:30], names[30:]):
+                    self.assertEqual(sum(dm.track_group(p) == "melon" for p in batch), 20)
+                    self.assertEqual(sum(dm.track_group(p) == "other" for p in batch), 10)
                 clock.now.return_value = datetime(2026, 9, 29, 4, 59)
                 await runner().tick(context)
-                self.assertEqual(bot.send_audio.await_count, 20)
+                self.assertEqual(bot.send_audio.await_count, 60)
+                # Only 10 melon + 5 other tracks remain today; do not fill either shortage
+                # from the opposite group, even though more tracks exist there.
+                clock.now.return_value = datetime(2026, 9, 28, 15, 0)
+                with patch.dict(os.environ, {"RECOMMEND_MELON_COUNT": "35", "RECOMMEND_OTHER_COUNT": "10"}):
+                    await runner().tick(context)
+                self.assertEqual(bot.send_audio.await_count, 70)
+                extras = bot.send_audio.await_args_list[60:]
+                self.assertTrue(all(dm.track_group(c.kwargs["audio"].name) == "melon" for c in extras))
 
 if __name__ == "__main__":
     unittest.main()
