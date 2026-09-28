@@ -1,103 +1,155 @@
-## 🚀 실행 순서
+# Telegram Music Bot
 
-1. **사전 요구 충족**: Docker 및 Docker Compose가 설치되어 있어야 하며, 로컬 서버(또는 컨테이너)에서 Ollama가 실행 중이어야 합니다. (Mica 모델 다운로드 필수: `docker exec -it ollama ollama pull hf.co/sky7350/Mica-v0.1-4B:Q5_K_M`)
-2. **동의어 사전 및 도구 설정**: 
-   - `app/artist_aliases.py`에서 검색할 폴더명과 가수 이름의 동의어/줄임말을 설정합니다. (예: `melon_top100` -> `멜론`)
-3. **음악 파일 색인화 (Indexing)**:
+로컬 음원을 검색해서 Telegram으로 보내는 봇입니다. 자연어 요청에 응답하며,
+사용자 요청 없이도 Mica가 날씨·온도·계절·주가·뉴스를 참고해 매일 음악을 추천합니다.
+음악 파일은 기존 로컬 라이브러리에서 선택합니다.
+
+## 1. 자동 추천 일정
+
+기본 시간대는 `Asia/Seoul`입니다. 매 회차 **Melon Top 100 4곡 + 기타 디렉토리 6곡**,
+하루 총 20곡을 선택합니다. 개수는 아래 환경 설정으로 변경할 수 있습니다.
+
+| 시간 | 평일 날씨·온도 기준 | 주말 기준 |
+| --- | --- | --- |
+| 오전 05:00 | 경기도 군포·광명 | 전국 주요 지역 |
+| 오후 15:00 | 경기도 화성 | 전국 주요 지역 |
+
+주말 대표 지점은 서울·강릉·대전·광주·대구·부산·제주입니다.
+날씨는 Open-Meteo, 주가는 Yahoo Finance의 코스피 최근 값, 이슈는 한국 Google News RSS를 사용합니다.
+휴장일 주가는 최근 거래 값이며, 조회 실패 정보는 누락으로 처리합니다.
+Mica 호출 실패 시 계절·시간대에 맞는 기본 분위기로 검색합니다.
+
+## 2. 디렉토리와 준비 사항
+
+작업과 실행은 `/home/now0930/telegram_music_channel`에서 진행합니다.
+Docker Compose, 접근 가능한 Ollama 서버, Telegram 봇 토큰, 음원과 색인 DB가 필요합니다.
+기본 Compose는 기존 외부 Docker 네트워크 `ollama_network`를 사용합니다.
+
+| 호스트 경로 | 컨테이너 경로 | 용도 |
+| --- | --- | --- |
+| `/mnt/ExtSSD/MP3` | `/music` | 읽기 전용 음원 |
+| `app` | `/app` | 코드와 운영 데이터 |
+| `app/music_vector_db` | `/app/music_vector_db` | 실제 운영 ChromaDB |
+| `app/bot_data.db` | `/app/bot_data.db` | 대화 및 자동 발송 이력 |
+| `music_vector_db` | `/app/vector_db` | 기존 별도 마운트 |
+
+저장소 루트의 `music_vector_db`를 `/app/music_vector_db`에 마운트하면
+`app` 아래의 실제 운영 DB가 가려집니다. 기존 운영 DB와 백업은 유지하세요.
+
+Ollama 컨테이너 이름이 `ollama`라면 필요한 모델을 다음과 같이 준비합니다.
+
 ```bash
-   python app/indexer.py
-   ```
-   - 이 스크립트는 로컬 디렉토리의 음악 파일을 읽어 메타데이터(연대, 분위기, 장르 등)를 추출하고 AI 임베딩을 생성하여 ChromaDB에 저장합니다.
-4. **텔레그램 봇(에이전트) 실행**:
-```bash
-   docker compose up -d --build
-   ```
-   - 봇이 대기 상태가 되며, 자연어 요청을 분석해 적절한 시스템 도구(Function)를 호출할 준비를 마칩니다.
+docker exec ollama ollama pull hf.co/sky7350/Mica-v0.1-4B:Q5_K_M
+docker exec ollama ollama pull mxbai-embed-large
+```
 
-## 🎛️ 사용 방법
+## 3. 환경 설정과 수신 대상
 
-텔레그램에서 봇과 1:1 대화를 시작하거나, 봇을 운영 중인 음악 채널에 관리자로 초대합니다. 다음과 같이 일상적인 자연어로 원하는 음악을 요청해 보세요:
-
-- **일반 조건 검색**: "기분 좋은 팝송 3개만 추천해줘", "90년대 잔잔한 연주곡 틀어줘"
-- **디렉토리(폴더) 타겟팅 검색**: "멜론에서 아이유 노래 찾아줘", "방탄 폴더에 있는 신나는 노래 2개"
-- **복합 검색**: "2010년대 발라드 중에서 쓸쓸한 노래"
-
-봇이 Function Calling을 통해 요청을 정확한 DB 쿼리로 변환하고, 조건에 맞는 오디오 파일을 텔레그램으로 즉시 전송합니다.
-
-## ⚙️ 어떻게 동작하는지 (작동 원리)
-
-- **`app/indexer.py` (색인 단계)**:
-  1. 로컬의 음악 파일들을 순회하며 메타데이터(제목, 가수, 장르, BPM, 경로 등)를 추출합니다.
-  2. Ollama를 활용해 해당 음악 정보를 텍스트로 요약하고 벡터(Embedding)로 변환합니다.
-  3. 벡터값과 메타데이터를 로컬 벡터 데이터베이스인 ChromaDB에 저장합니다.
-
-- **`app/main.py` (AI 에이전트 검색 및 출력 단계)**:
-  1. **Function Calling (도구 호출)**: Ollama(Mica) 모델이 사용자의 자연어를 분석해, 사전에 정의된 `agent_tools.py`의 파라미터(JSON)로 정확히 변환합니다. (예: `{"directory": "멜론", "mood": "신나는"}`)
-  2. **동의어 확장 매칭 (Alias)**: 추출된 단어를 `artist_aliases.py`와 대조하여 실제 물리적 폴더명이나 다양한 가수 표기법으로 확장합니다.
-  3. **메타데이터 하드 필터링 (0단계)**: 벡터 검색의 오차를 줄이기 위해 ChromaDB의 SQLite 스키마를 활용, 조건에 맞지 않는 곡들을 1차로 완벽하게 걸러냅니다.
-  4. **시맨틱 벡터 검색**: 필터링된 결과 내에서 HNSW 알고리즘을 통해 의미적으로 가장 유사한 음악을 최종 선별합니다.
-  5. 검색된 음악 파일의 로컬 경로를 읽어 텔레그램 채널에 오디오 파일로 전송합니다.
-
-## 🔮 향후 개선점
-
-- **다중 도구(Multi-Tool) 확장**: 단순 음악 검색을 넘어, 홈 서버 디스크 용량 모니터링, 유튜브 음원 자동 다운로드 등 에이전트가 수행할 수 있는 Function Calling 도구 추가.
-- **고급 오디오 분석**: 메타데이터 의존을 넘어 `librosa` 등의 라이브러리를 활용해 실제 오디오 피처(비트 패턴 등)를 직접 분석하여 벡터에 추가.
-- **상호작용 강화**: 텔레그램 인라인 키보드(Inline Keyboard)를 도입하여 여러 검색 결과 중 원하는 곡을 선택할 수 있는 페이지네이션 기능 구현.
-- **장기 기억(Long-term Memory) 도입**: 사용자의 과거 검색 성공 이력과 취향을 SQLite에 누적하여, 다음 검색 시 에이전트가 이를 참고하는 개인화 기능 추가.
-
-## 매일 자동 추천 (Mica)
-
-사용자 메시지가 없어도 한국시간 오전 **05:00**, 오후 **15:00**에 각각 기본 30곡(Melon Top 100 20곡 + 기타 10곡)을
-`MUSIC_CHANNEL_ID` 채널에 오디오로 전송합니다. 예약 시각에 실행하며, 재시작·미완료 회차를 5분 간격으로 확인합니다.
-평일 오전은 **경기도 군포·광명**, 오후는 **화성**의 날씨와 온도를 사용합니다.
-주말은 서울·강릉·대전·광주·대구·부산·제주를 전국 대표 지점으로 사용합니다.
-계절, 코스피 최근 시세와 기준 종가·시세 시각, 한국 주요 뉴스 제목을 함께 Mica에 전달하여
-음악 분위기/장르를 생성하고 기존 ChromaDB에서 실제 파일을 찾습니다.
-
-1. `cp .env.example .env` 후 `TELEGRAM_TOKEN`, `MUSIC_CHANNEL_ID`를 입력합니다.
-   채널 ID는 `-100...` 또는 공개 채널의 `@username`입니다. 봇에 채널 게시 권한을 주세요.
-2. 기존 필터에서 사용한 Ollama 서버를 `OLLAMA_HOST`로 지정합니다.
-   기본 모델은 `hf.co/sky7350/Mica-v0.1-4B:Q5_K_M`입니다.
-   임베딩용 `mxbai-embed-large`도 같은 서버에 필요합니다.
-3. 색인 데이터는 저장소의 `app/music_vector_db`에, 음원은 `/mnt/ExtSSD/MP3`에 준비합니다.
-   컨테이너에서 색인과 봇 모두 `/app/music_vector_db`, `/music`을 사용해야 합니다.
-4. `docker compose up -d`로 실행하고 `docker compose logs -f`로 확인합니다.
-
-`RECOMMEND_MORNING`, `RECOMMEND_AFTERNOON`, `RECOMMEND_TIMEZONE`으로 시각을 바꿀 수 있습니다.
-`RECOMMEND_ENABLED=false` 또는 빈 채널 ID이면 자동 발송을 끕니다. 기존 대화 검색은 유지됩니다.
-시작 시 오늘의 가장 최근 예약 회차만 보충합니다. 오후에 처음 켜면 오전 분량을 몰아서 보내지 않습니다.
-성공한 곡과 전송 결과가 불확실한 곡은 `app/bot_data.db`에 기록해 같은 날 다시 보내지 않습니다.
-오전·오후를 합쳐 Melon Top 100에 최소 40곡, 기타 디렉토리에 최소 20곡의 서로 다른 재생 가능한 음원이 있어야 하루 60곡을 채울 수 있습니다.
-전체 색인을 분위기 유사도 순으로 검색하고 각 디렉토리 할당량까지 선택합니다. 한쪽 음원이 부족하면 다른 쪽으로 대체하지 않고 로그에 남깁니다.
-
-외부 정보 조회 실패는 누락으로 표시하고, Mica 실패 시 계절·시간대 기반으로 검색합니다.
-주가 데이터는 Yahoo Finance 공개 엔드포인트로 휴장일에는 최근 거래 값이며 이용 제한 시 누락됩니다.
-날씨는 [Open-Meteo](https://open-meteo.com/en/docs), 뉴스는 Google News RSS를 사용합니다.
-Mica는 [Ollama JSON 스키마 출력](https://ollama.com/blog/structured-outputs)을 사용합니다.
-전송 타임아웃/프로세스 종료 때 중복 전송을 막기 위해 전송 전에 예약 기록을 남깁니다.
-이 경우 실제 전송량이 설정한 곡 수보다 적을 수 있으며 `pending` 기록과 채널을 운영자가 확인해야 합니다.
-자동 추천 게시물은 기존 대화 응답의 TTL 삭제 대상에 넣지 않습니다.
-
-검증: `python3 -m unittest discover -s tests -v` (실제 채널 발송 없음).
-
-기존 운영 DB는 `app/music_vector_db`이며 `./app:/app` 마운트로 접근합니다.
-저장소 루트 `music_vector_db`는 기존처럼 `/app/vector_db`에 연결됩니다.
-이를 `/app/music_vector_db`에 마운트하면 실제 색인을 가릴 수 있으므로 변경하지 마세요.
-
-### 디렉토리별 추천 개수 설정
-
-`/home/now0930/telegram_music_channel/.env`에서 매 회차 개수를 지정하세요.
+처음 설치할 때만 `.env.example`을 `.env`로 복사하고 값을 채웁니다.
+기존 `.env`가 있다면 덮어쓰지 말고 필요한 항목만 수정하세요.
 
 ```dotenv
-RECOMMEND_MELON_COUNT=20
-RECOMMEND_OTHER_COUNT=10
+TELEGRAM_TOKEN=발급받은_봇_토큰
+MUSIC_CHANNEL_ID=받을_대화방_ID
+OLLAMA_HOST=http://ollama:11434
+OLLAMA_MODEL=hf.co/sky7350/Mica-v0.1-4B:Q5_K_M
+RECOMMEND_ENABLED=true
+RECOMMEND_TIMEZONE=Asia/Seoul
+RECOMMEND_MORNING=05:00
+RECOMMEND_AFTERNOON=15:00
+RECOMMEND_MELON_COUNT=4
+RECOMMEND_OTHER_COUNT=6
 RECOMMEND_MELON_DIRECTORY=melon_top100
 ```
 
-기본값은 오전 20+10곡, 오후 20+10곡으로 하루 총 60곡입니다.
-예를 들어 `15`, `15`로 바꾸면 회차마다 1:1로 선택합니다.
-한쪽을 `0`으로 설정할 수 있으며 합계는 1~100곡이어야 합니다.
-디렉토리 이름은 경로 구성 요소 단위로 비교하며 대소문자·공백·밑줄·하이픈은 무시합니다.
-따라서 `melon top 100`, `melon_top100`은 동일하게 인식합니다.
-설정 후 `docker compose up -d --force-recreate`로 적용합니다.
-당일 이미 보낸 곡도 각 그룹 할당량에 포함하므로, 회차 도중 개수를 늘리면 부족분만 추가됩니다.
+`MUSIC_CHANNEL_ID`는 이름과 달리 **개인 대화방도 지원**합니다.
+
+- 개인 대화방: 봇과 대화를 시작하고 `ID`를 보내면 반환되는 숫자를 입력합니다.
+- 채널: 채널의 `-100…` 숫자 ID 또는 공개 `@username`을 입력하고,
+  봇을 메시지 게시 권한이 있는 관리자로 추가합니다.
+
+봇의 `@username`은 발신 계정이며 수신 대화방 ID를 대신하지 않습니다.
+`RECOMMEND_ENABLED=false` 또는 빈 수신 ID이면 예약 발송만 중지하고 대화 검색은 유지합니다.
+
+### 추천 개수 변경
+
+`RECOMMEND_MELON_COUNT`와 `RECOMMEND_OTHER_COUNT`는 **매 회차 곡 수**입니다.
+예를 들어 `5`, `5`는 1:1, `4`, `6`은 4:6입니다. 한쪽은 0으로 설정할 수 있고 합계는 1~100이어야 합니다.
+폴더명은 경로 구성 요소 단위로 비교하며 대소문자·공백·밑줄·하이픈은 무시합니다.
+`melon top 100`, `melon_top100`, `Melon-Top-100`은 같은 폴더명으로 취급합니다.
+해당 폴더의 하위 폴더도 Melon 그룹에 포함합니다.
+
+주가 종목과 뉴스 주소는 `.env.example`의 `RECOMMEND_MARKET_SYMBOL`, `RECOMMEND_NEWS_RSS`로 변경합니다.
+
+## 4. 실행과 업데이트
+
+```bash
+cd /home/now0930/telegram_music_channel
+docker compose up -d --force-recreate
+docker compose logs --since=2m -f
+```
+
+현재 Compose는 컨테이너 시작 시 Python 패키지를 설치하므로 봇 시작까지 시간이 걸릴 수 있습니다.
+로그의 `Music DB: ... (N tracks)`로 실제 색인 곡 수를 확인하세요.
+
+GitHub 변경을 받을 때는 위 실행 명령 전에 `git pull --ff-only origin main`을 실행합니다.
+서버 파일이나 `.env`를 직접 수정한 경우에는 pull 없이 재시작하면 됩니다.
+`.env`는 Git 추적 대상이 아니며 토큰을 저장소에 올리지 않습니다.
+
+기존 색인이 있으면 다시 생성할 필요가 없습니다. 새 음원을 색인할 때는
+실행 중인 컨테이너에서 동일한 `/app` 작업 디렉토리와 `/music` 경로를 사용합니다.
+
+```bash
+docker compose exec -w /app music-ai-agent python indexer.py
+```
+
+## 5. Telegram 사용 방법
+
+봇과의 대화방에 다음과 같이 요청합니다.
+
+- `멜론에서 아이유 노래 3곡 찾아줘`
+- `90년대 잔잔한 연주곡 추천해줘`
+- `기분 좋은 팝송 5곡 보내줘`
+- `ID`: 현재 대화방 ID 확인
+- `DB`: 색인 곡 수 확인
+
+대화 요청은 요청한 대화방으로 응답합니다. 예약 발송은 설정한 `MUSIC_CHANNEL_ID`로 보냅니다.
+가수·폴더 동의어는 `app/artist_aliases.py`에서 관리합니다.
+
+## 6. 예약 발송과 오류 처리
+
+예약 시각에 실행하고 5분마다 미완료 회차를 확인합니다. 재시작 시 오늘의 가장 최근 회차만
+보충하므로 오후에 켜면 오전 분량을 함께 발송하지 않습니다.
+같은 날 이미 보낸 파일은 재사용하지 않으며 재시작해도 이력을 유지합니다.
+기본 하루 분량을 채우려면 Melon 8곡, 기타 12곡 이상의 서로 다른 사용 가능한 파일이 필요합니다.
+그룹별 음원이 부족하면 다른 그룹으로 대체하지 않고 부족분을 로그에 남깁니다.
+설정한 개수를 늘리면 오늘 회차의 부족분을 추가 발송할 수 있으며, 줄여도 이미 보낸 곡을 회수하지 않습니다.
+
+발송 전에 SQLite에 `pending`을 기록하고 성공하면 `sent`로 변경합니다.
+Telegram이 명확히 거절하면 해당 예약을 해제하고 회차를 중단합니다.
+타임아웃이나 프로세스 종료처럼 결과가 불확실하면 중복 방지를 위해 `pending`을 유지하므로
+실제 받은 곡 수가 설정값보다 적을 수 있습니다. 이 경우 대화방과 발송 이력을 대조해야 합니다.
+자동 추천 파일은 기존 대화 응답의 TTL 삭제 대상에 포함하지 않습니다.
+
+| 증상 | 확인할 사항 |
+| --- | --- |
+| `Chat not found` | 수신 ID, 개인 대화 시작 여부, 채널 봇 가입·권한 |
+| `Music library is empty` 또는 0곡 | DB 마운트와 `app/music_vector_db`의 실제 색인 |
+| 특정 그룹 곡 부족 | 폴더명, 실제 파일 존재 여부, 당일 발송 이력 |
+| Mica 연결 실패 | Ollama 주소·네트워크·모델 설치 여부 |
+
+## 7. 코드 구성과 검증
+
+| 파일 | 역할 |
+| --- | --- |
+| `app/main.py` | 대화 요청 분석, 검색, Telegram 봇 실행 |
+| `app/daily_music.py` | 외부 정보 수집, Mica 추천, 그룹별 선택, 예약·발송 이력 |
+| `app/indexer.py` | 로컬 음원 메타데이터와 임베딩 색인 |
+| `app/agent_tools.py` | 대화 검색 도구 스키마 |
+| `tests/test_daily_music.py` | 지역·시각·비율·중복 방지·전송 거절 회귀 테스트 |
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+테스트는 외부 요청과 Telegram 전송을 모의 처리합니다. 실제 전송 결과는 운영 로그와 수신 대화방에서 확인합니다.

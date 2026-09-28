@@ -99,8 +99,8 @@ def track_group(path):
 
 
 def read_quotas():
-    quotas = {"melon": int(os.getenv("RECOMMEND_MELON_COUNT", "20")),
-              "other": int(os.getenv("RECOMMEND_OTHER_COUNT", "10"))}
+    quotas = {"melon": int(os.getenv("RECOMMEND_MELON_COUNT", "4")),
+              "other": int(os.getenv("RECOMMEND_OTHER_COUNT", "6"))}
     if any(n < 0 for n in quotas.values()) or not 1 <= sum(quotas.values()) <= 100:
         raise ValueError("Recommendation counts must be nonnegative and total between 1 and 100")
     if not directory_key(os.getenv("RECOMMEND_MELON_DIRECTORY", "melon_top100")):
@@ -135,6 +135,47 @@ class DailyMusic:
         finally:
             connection.close()
 
+    def delivery_progress(self, day, slot):
+        """Pending sends count toward quotas to avoid ambiguous duplicate delivery."""
+        with self.db() as db:
+            rows = db.execute(
+                "SELECT path, slot FROM daily_deliveries WHERE channel=? AND day=?",
+                (str(self.channel), day),
+            ).fetchall()
+        used = {path for path, _ in rows}
+        counts = {group: 0 for group in self.quotas}
+        for path, sent_slot in rows:
+            if sent_slot == slot:
+                counts[track_group(path)] += 1
+        return used, counts
+
+    def quota_reached(self, counts):
+        return all(counts[group] >= quota for group, quota in self.quotas.items())
+
+    def reserve_delivery(self, day, slot, path):
+        with self.db() as db:
+            return bool(db.execute(
+                "INSERT OR IGNORE INTO daily_deliveries VALUES (?, ?, ?, ?, 'pending')",
+                (str(self.channel), day, slot, path),
+            ).rowcount)
+
+    def finish_delivery(self, day, path, *, rejected=False):
+        query = (
+            "DELETE FROM daily_deliveries WHERE channel=? AND day=? AND path=? AND state='pending'"
+            if rejected else
+            "UPDATE daily_deliveries SET state='sent' WHERE channel=? AND day=? AND path=?"
+        )
+        with self.db() as db:
+            db.execute(query, (str(self.channel), day, path))
+
+    async def recommendation_query(self, now, slot):
+        data = await asyncio.to_thread(collect_context, now, slot)
+        try:
+            return await asyncio.to_thread(choose_query, self.client, data, slot)
+        except Exception:
+            log.exception("Mica unavailable; using seasonal music query")
+            return data["season"] + (" 상쾌한 활기찬 음악" if slot == "오전" else "편안한 감성 음악")
+
     def candidates(self, query):
         count = self.collection.count()
         if not count:
@@ -157,14 +198,9 @@ class DailyMusic:
                 return
             slot = due[-1][0]
             day = now.date().isoformat()
-            with self.db() as db:
-                rows = db.execute("SELECT path, slot, state FROM daily_deliveries WHERE channel=? AND day=?",
-                                  (str(self.channel), day)).fetchall()
-            used = {row[0] for row in rows}
-            counts = {group: sum(row[1] == slot and track_group(row[0]) == group for row in rows)
-                      for group in self.quotas}
+            used, counts = self.delivery_progress(day, slot)
             completed = sum(counts.values())
-            if all(counts[group] >= quota for group, quota in self.quotas.items()):
+            if self.quota_reached(counts):
                 return
             try:
                 # Validate the destination before reserving tracks or querying Mica.
@@ -173,28 +209,20 @@ class DailyMusic:
                 except (BadRequest, Forbidden):
                     log.error("Channel inaccessible: check MUSIC_CHANNEL_ID and bot channel membership/posting permissions")
                     return
-                data = await asyncio.to_thread(collect_context, now, slot)
-                try:
-                    query = await asyncio.to_thread(choose_query, self.client, data, slot)
-                except Exception:
-                    log.exception("Mica unavailable; using seasonal music query")
-                    query = data["season"] + (" 상쾌한 활기찬 음악" if slot == "오전" else "편안한 감성 음악")
+                query = await self.recommendation_query(now, slot)
                 candidates = await asyncio.to_thread(self.candidates, query)
+                music_root = Path(os.getenv("MUSIC_PATH", "/music")).resolve()
                 for path, meta in candidates:
                     path = str(Path(path).resolve())
-                    music_root = Path(os.getenv("MUSIC_PATH", "/music")).resolve()
                     if path in used or not Path(path).is_relative_to(music_root) or not Path(path).is_file():
                         continue
-                    if all(counts[group] >= quota for group, quota in self.quotas.items()):
+                    if self.quota_reached(counts):
                         break
                     group = track_group(path)
                     if counts[group] >= self.quotas[group]:
                         continue
                     # Reserve before sending: ambiguous timeouts/crashes must not resend audio.
-                    with self.db() as db:
-                        inserted = db.execute("INSERT OR IGNORE INTO daily_deliveries VALUES (?, ?, ?, ?, 'pending')",
-                            (str(self.channel), day, slot, path)).rowcount
-                    if not inserted:
+                    if not self.reserve_delivery(day, slot, path):
                         continue
                     used.add(path)
                     completed += 1
@@ -205,14 +233,10 @@ class DailyMusic:
                                 caption=(f"🎵 {day} {slot} 추천 {completed}/{self.total}\n"
                                     f"{meta.get('artist', '')} - {meta.get('title', '')}\n{query}")[:1024],
                                 write_timeout=120, read_timeout=120, connect_timeout=30)
-                        with self.db() as db:
-                            db.execute("UPDATE daily_deliveries SET state='sent' WHERE channel=? AND day=? AND path=?",
-                                       (str(self.channel), day, path))
+                        self.finish_delivery(day, path)
                     except (BadRequest, Forbidden, RetryAfter) as exc:
                         # Telegram explicitly rejected this request: nothing was delivered.
-                        with self.db() as db:
-                            db.execute("DELETE FROM daily_deliveries WHERE channel=? AND day=? AND path=? AND state='pending'",
-                                       (str(self.channel), day, path))
+                        self.finish_delivery(day, path, rejected=True)
                         log.error("Telegram rejected delivery (%s): %s; stopping this batch", type(exc).__name__, exc)
                         return
                     except Exception:

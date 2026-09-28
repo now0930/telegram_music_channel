@@ -27,6 +27,10 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(dm.track_group("/music/not_melon_top100/song.mp3"), "other")
         self.assertEqual(dm.track_group("/music/other/melon_top100.mp3"), "other")
 
+    @patch.dict(os.environ, {}, clear=True)
+    def test_default_counts(self):
+        self.assertEqual(dm.read_quotas(), {"melon": 4, "other": 6})
+
     def test_weekday_regions(self):
         now = datetime(2026, 9, 28)
         self.assertEqual([x[0] for x in dm.locations_for(now, "오전")], ["군포", "광명"])
