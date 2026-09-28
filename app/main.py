@@ -52,9 +52,9 @@ logger = logging.getLogger("music_bot")
 #  ⚙️ 설정
 # ═════════════════════════════════════════════════════════════════════════════════════
 MUSIC_PATH = "/music"
-DB_PATH = "./music_vector_db"
+DB_PATH = os.getenv("MUSIC_DB_PATH", "./music_vector_db")
 
-TEXT_MODEL = os.getenv("OLLAMA_MODEL", "hermes3")
+TEXT_MODEL = os.getenv("OLLAMA_MODEL", "hf.co/sky7350/Mica-v0.1-4B:Q5_K_M")
 EMBED_MODEL = "mxbai-embed-large"
 
 MAX_RESULTS = 10
@@ -350,6 +350,7 @@ def _extract_intent_sync(user_query: str) -> dict:
     try:
         response = ollama.chat(
             model=TEXT_MODEL,
+            think=False,
             messages=[
                 {
                     "role": "system",
@@ -393,6 +394,7 @@ def _extract_intent_sync(user_query: str) -> dict:
     try:
         json_response = ollama.chat(
             model=TEXT_MODEL,
+            think=False,
             messages=[
                 {
                     "role": "system",
@@ -760,6 +762,8 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def post_init(application):
     await init_db()
     asyncio.create_task(ttl_cleanup_task(application))
+    from daily_music import install
+    install(application, collection, BOT_DB_PATH, EMBED_MODEL, OLLAMA_HOST)
 
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()

@@ -1,6 +1,6 @@
 ## 🚀 실행 순서
 
-1. **사전 요구 충족**: Docker 및 Docker Compose가 설치되어 있어야 하며, 로컬 서버(또는 컨테이너)에서 Ollama가 실행 중이어야 합니다. (Hermes 3 모델 다운로드 필수: `docker exec -it ollama ollama pull hermes3`)
+1. **사전 요구 충족**: Docker 및 Docker Compose가 설치되어 있어야 하며, 로컬 서버(또는 컨테이너)에서 Ollama가 실행 중이어야 합니다. (Mica 모델 다운로드 필수: `docker exec -it ollama ollama pull hf.co/sky7350/Mica-v0.1-4B:Q5_K_M`)
 2. **동의어 사전 및 도구 설정**: 
    - `app/artist_aliases.py`에서 검색할 폴더명과 가수 이름의 동의어/줄임말을 설정합니다. (예: `melon_top100` -> `멜론`)
 3. **음악 파일 색인화 (Indexing)**:
@@ -32,7 +32,7 @@
   3. 벡터값과 메타데이터를 로컬 벡터 데이터베이스인 ChromaDB에 저장합니다.
 
 - **`app/main.py` (AI 에이전트 검색 및 출력 단계)**:
-  1. **Function Calling (도구 호출)**: Ollama(Hermes 3) 모델이 사용자의 자연어를 분석해, 사전에 정의된 `agent_tools.py`의 파라미터(JSON)로 정확히 변환합니다. (예: `{"directory": "멜론", "mood": "신나는"}`)
+  1. **Function Calling (도구 호출)**: Ollama(Mica) 모델이 사용자의 자연어를 분석해, 사전에 정의된 `agent_tools.py`의 파라미터(JSON)로 정확히 변환합니다. (예: `{"directory": "멜론", "mood": "신나는"}`)
   2. **동의어 확장 매칭 (Alias)**: 추출된 단어를 `artist_aliases.py`와 대조하여 실제 물리적 폴더명이나 다양한 가수 표기법으로 확장합니다.
   3. **메타데이터 하드 필터링 (0단계)**: 벡터 검색의 오차를 줄이기 위해 ChromaDB의 SQLite 스키마를 활용, 조건에 맞지 않는 곡들을 1차로 완벽하게 걸러냅니다.
   4. **시맨틱 벡터 검색**: 필터링된 결과 내에서 HNSW 알고리즘을 통해 의미적으로 가장 유사한 음악을 최종 선별합니다.
@@ -44,3 +44,38 @@
 - **고급 오디오 분석**: 메타데이터 의존을 넘어 `librosa` 등의 라이브러리를 활용해 실제 오디오 피처(비트 패턴 등)를 직접 분석하여 벡터에 추가.
 - **상호작용 강화**: 텔레그램 인라인 키보드(Inline Keyboard)를 도입하여 여러 검색 결과 중 원하는 곡을 선택할 수 있는 페이지네이션 기능 구현.
 - **장기 기억(Long-term Memory) 도입**: 사용자의 과거 검색 성공 이력과 취향을 SQLite에 누적하여, 다음 검색 시 에이전트가 이를 참고하는 개인화 기능 추가.
+
+## 매일 자동 추천 (Mica)
+
+사용자 메시지가 없어도 한국시간 오전 **05:00**, 오후 **15:00**에 각각 10곡을
+`MUSIC_CHANNEL_ID` 채널에 오디오로 전송합니다. 예약 시각에 실행하며, 재시작·미완료 회차를 5분 간격으로 확인합니다.
+평일 오전은 **경기도 군포·광명**, 오후는 **화성**의 날씨와 온도를 사용합니다.
+주말은 서울·강릉·대전·광주·대구·부산·제주를 전국 대표 지점으로 사용합니다.
+계절, 코스피 최근 시세와 기준 종가·시세 시각, 한국 주요 뉴스 제목을 함께 Mica에 전달하여
+음악 분위기/장르를 생성하고 기존 ChromaDB에서 실제 파일을 찾습니다.
+
+1. `cp .env.example .env` 후 `TELEGRAM_TOKEN`, `MUSIC_CHANNEL_ID`를 입력합니다.
+   채널 ID는 `-100...` 또는 공개 채널의 `@username`입니다. 봇에 채널 게시 권한을 주세요.
+2. 기존 필터에서 사용한 Ollama 서버를 `OLLAMA_HOST`로 지정합니다.
+   기본 모델은 `hf.co/sky7350/Mica-v0.1-4B:Q5_K_M`입니다.
+   임베딩용 `mxbai-embed-large`도 같은 서버에 필요합니다.
+3. 색인 데이터는 저장소의 `music_vector_db`에, 음원은 `/mnt/ExtSSD/MP3`에 준비합니다.
+   컨테이너에서 색인과 봇 모두 `/app/music_vector_db`, `/music`을 사용해야 합니다.
+4. `docker compose up -d`로 실행하고 `docker compose logs -f`로 확인합니다.
+
+`RECOMMEND_MORNING`, `RECOMMEND_AFTERNOON`, `RECOMMEND_TIMEZONE`으로 시각을 바꿀 수 있습니다.
+`RECOMMEND_ENABLED=false` 또는 빈 채널 ID이면 자동 발송을 끕니다. 기존 대화 검색은 유지됩니다.
+시작 시 오늘의 가장 최근 예약 회차만 보충합니다. 오후에 처음 켜면 오전 분량을 몰아서 보내지 않습니다.
+성공한 곡과 전송 결과가 불확실한 곡은 `app/bot_data.db`에 기록해 같은 날 다시 보내지 않습니다.
+오전·오후를 합쳐 최소 20개의 서로 다른 재생 가능한 음원이 있어야 20곡을 채울 수 있습니다.
+검색 후보 상위 200개에 유효한 곡이 부족하면 가능한 만큼만 보내고 로그에 남깁니다.
+
+외부 정보 조회 실패는 누락으로 표시하고, Mica 실패 시 계절·시간대 기반으로 검색합니다.
+주가 데이터는 Yahoo Finance 공개 엔드포인트로 휴장일에는 최근 거래 값이며 이용 제한 시 누락됩니다.
+날씨는 [Open-Meteo](https://open-meteo.com/en/docs), 뉴스는 Google News RSS를 사용합니다.
+Mica는 [Ollama JSON 스키마 출력](https://ollama.com/blog/structured-outputs)을 사용합니다.
+전송 타임아웃/프로세스 종료 때 중복 전송을 막기 위해 전송 전에 예약 기록을 남깁니다.
+이 경우 실제 전송량이 10곡보다 적을 수 있으며 `pending` 기록과 채널을 운영자가 확인해야 합니다.
+자동 추천 게시물은 기존 대화 응답의 TTL 삭제 대상에 넣지 않습니다.
+
+검증: `python3 -m unittest discover -s tests -v` (실제 채널 발송 없음).

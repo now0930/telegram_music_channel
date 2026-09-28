@@ -6,7 +6,7 @@ services:
     volumes:
       - /mnt/ExtSSD/MP3:/music:ro
       - ./app:/app
-      - ./music_vector_db:/app/vector_db
+      - ./music_vector_db:/app/music_vector_db
       - ./.env:/app/.env  # 호스트의 .env를 컨테이너의 /app/.env로 연결
     working_dir: /app
     # 컨테이너 시작 시 라이브러리 설치 후 실행
@@ -18,11 +18,11 @@ services:
       
     # 2. 개별 환경 변수 설정
     environment:
-      - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://ollama:11434}
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
       - MUSIC_CHANNEL_ID=${MUSIC_CHANNEL_ID}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - OLLAMA_MODEL=qwen3.5:9b          # ← 추가! (Function Calling 안정적)
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-hf.co/sky7350/Mica-v0.1-4B:Q5_K_M}
 
     networks:
       - ollama_network
