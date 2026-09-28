@@ -761,6 +761,18 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ═════════════════════════════════════════════════════════════════════════════════════
 #  🚀 진입점
 # ═════════════════════════════════════════════════════════════════════════════════════
+async def handle_application_error(update, context):
+    from telegram.error import NetworkError
+    error = context.error
+    if update is None and isinstance(error, NetworkError):
+        logger.warning(
+            "Telegram background network error (%s); polling retries are managed by python-telegram-bot.",
+            type(error).__name__,
+        )
+        return
+    logger.error("Unhandled Telegram application error", exc_info=(type(error), error, error.__traceback__))
+
+
 async def post_init(application):
     await init_db()
     asyncio.create_task(ttl_cleanup_task(application))
@@ -769,6 +781,8 @@ async def post_init(application):
 
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+
+    app.add_error_handler(handle_application_error)
 
     app.add_handler(
         MessageHandler(

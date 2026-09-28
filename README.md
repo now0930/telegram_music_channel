@@ -136,6 +136,7 @@ Telegram이 명확히 거절하면 해당 예약을 해제하고 회차를 중�
 | `Chat not found` | 수신 ID, 개인 대화 시작 여부, 채널 봇 가입·권한 |
 | `Music library is empty` 또는 0곡 | DB 마운트와 `app/music_vector_db`의 실제 색인 |
 | 특정 그룹 곡 부족 | 폴더명, 실제 파일 존재 여부, 당일 발송 이력 |
+| `NetworkError` / `httpx.ReadError` in `get_updates` | Telegram 메시지 조회 중 네트워크 오류. 라이브러리가 재시도하며, 반복되면 서버 연결 상태 확인 |
 | Mica 연결 실패 | Ollama 주소·네트워크·모델 설치 여부 |
 
 ## 7. 코드 구성과 검증
@@ -153,3 +154,6 @@ python3 -m unittest discover -s tests -v
 ```
 
 테스트는 외부 요청과 Telegram 전송을 모의 처리합니다. 실제 전송 결과는 운영 로그와 수신 대화방에서 확인합니다.
+
+회차 상태 로그의 `sent`는 성공 기록, `pending`은 전송 결과 미확정 기록입니다.
+개수를 줄이기 전에 보낸 곡도 당일 이력에 포함되므로 `sent`가 새 설정 합계보다 클 수 있습니다.

@@ -149,6 +149,17 @@ class DailyMusic:
                 counts[track_group(path)] += 1
         return used, counts
 
+    def log_delivery_status(self, day, slot):
+        with self.db() as db:
+            rows = db.execute(
+                "SELECT state, COUNT(*) FROM daily_deliveries WHERE channel=? AND day=? AND slot=? GROUP BY state",
+                (str(self.channel), day, slot),
+            ).fetchall()
+        states = dict(rows)
+        log.info("%s %s delivery status: sent=%d pending=%d; target melon=%d other=%d",
+                 day, slot, states.get("sent", 0), states.get("pending", 0),
+                 self.quotas["melon"], self.quotas["other"])
+
     def quota_reached(self, counts):
         return all(counts[group] >= quota for group, quota in self.quotas.items())
 
@@ -201,6 +212,7 @@ class DailyMusic:
             used, counts = self.delivery_progress(day, slot)
             completed = sum(counts.values())
             if self.quota_reached(counts):
+                self.log_delivery_status(day, slot)
                 return
             try:
                 # Validate the destination before reserving tracks or querying Mica.
@@ -246,6 +258,7 @@ class DailyMusic:
                     if counts[group] < quota:
                         log.warning("%s %s: %s only %d/%d tracks available; no cross-directory substitution",
                                     day, slot, group, counts[group], quota)
+                self.log_delivery_status(day, slot)
             except Exception:
                 log.exception("Scheduled recommendation failed")
 
