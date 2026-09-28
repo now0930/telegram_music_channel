@@ -92,13 +92,31 @@ def read_quotas():
     return quotas
 
 
+def recipients():
+    """Keep the legacy recipient and append explicitly configured recipients."""
+    targets = []
+    for raw in [os.getenv("MUSIC_CHANNEL_ID", ""), *os.getenv("MUSIC_ADDITIONAL_CHAT_IDS", "").split(",")]:
+        raw = raw.strip()
+        if not raw:
+            continue
+        if re.fullmatch(r"-?[0-9]+", raw) and int(raw) != 0:
+            target = int(raw)
+        elif re.fullmatch(r"@[A-Za-z0-9_]+", raw):
+            target = raw.lower()
+        else:
+            raise ValueError("Invalid Telegram recipient ID")
+        if target not in targets:
+            targets.append(target)
+    return targets
+
+
 class DailyMusic:
-    def __init__(self, application, collection, db_path, embed_model, host):
+    def __init__(self, application, collection, db_path, embed_model, host, channel=None):
         import ollama
         self.application, self.collection = application, collection
         self.client = ollama.Client(host=host, timeout=120)
         self.embed_model = embed_model
-        channel = os.getenv("MUSIC_CHANNEL_ID", "").strip()
+        channel = str(channel if channel is not None else os.getenv("MUSIC_CHANNEL_ID", "")).strip()
         self.channel = int(channel) if channel.lstrip("-").isdigit() else channel
         self.timezone = ZoneInfo(os.getenv("RECOMMEND_TIMEZONE", "Asia/Seoul"))
         self.schedule = parse_schedule()
@@ -254,14 +272,19 @@ class DailyMusic:
 
 
 def install(application, collection, db_path, embed_model, host):
-    if os.getenv("RECOMMEND_ENABLED", "true").lower() != "true" or not os.getenv("MUSIC_CHANNEL_ID", "").strip():
+    if os.getenv("RECOMMEND_ENABLED", "true").lower() != "true":
+        return
+    targets = recipients()
+    if not targets:
         log.info("Daily recommendations disabled (set MUSIC_CHANNEL_ID to enable)")
         return
-    runner = DailyMusic(application, collection, db_path, embed_model, host)
-    for slot, at in runner.schedule:
-        application.job_queue.run_daily(runner.tick, time=at.replace(tzinfo=runner.timezone),
-                                        name="music-" + slot)
-    application.job_queue.run_repeating(runner.tick, interval=300, first=5,
-                                       job_kwargs={"max_instances": 1, "coalesce": True})
-    log.info("Daily recommendations enabled: %s (%s)", runner.schedule, runner.timezone)
-    log.info("Per batch quotas: melon=%d other=%d", runner.quotas["melon"], runner.quotas["other"])
+    for index, target in enumerate(targets):
+        runner = DailyMusic(application, collection, db_path, embed_model, host, channel=target)
+        for slot, at in runner.schedule:
+            application.job_queue.run_daily(runner.tick, time=at.replace(tzinfo=runner.timezone),
+                                            name=f"music-{index}-{slot}")
+        application.job_queue.run_repeating(runner.tick, interval=300, first=5 + index * 30,
+                                           name=f"music-{index}-catchup",
+                                           job_kwargs={"max_instances": 1, "coalesce": True})
+        log.info("Daily recommendations enabled: recipient=%s %s (%s)", target, runner.schedule, runner.timezone)
+        log.info("Per batch quotas: melon=%d other=%d", runner.quotas["melon"], runner.quotas["other"])
