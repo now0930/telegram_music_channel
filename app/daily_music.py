@@ -124,6 +124,7 @@ class DailyMusic:
                 zip(result["ids"][0], result["metadatas"][0]) if meta]
 
     async def tick(self, context):
+        from telegram.error import BadRequest, Forbidden, RetryAfter
         if self.lock.locked():
             return
         async with self.lock:
@@ -142,6 +143,12 @@ class DailyMusic:
             if completed >= 10:
                 return
             try:
+                # Validate the destination before reserving tracks or querying Mica.
+                try:
+                    await context.bot.get_chat(self.channel)
+                except (BadRequest, Forbidden):
+                    log.error("Channel inaccessible: check MUSIC_CHANNEL_ID and bot channel membership/posting permissions")
+                    return
                 data = await asyncio.to_thread(collect_context, now, slot)
                 try:
                     query = await asyncio.to_thread(choose_query, self.client, data, slot)
@@ -173,6 +180,13 @@ class DailyMusic:
                         with self.db() as db:
                             db.execute("UPDATE daily_deliveries SET state='sent' WHERE channel=? AND day=? AND path=?",
                                        (str(self.channel), day, path))
+                    except (BadRequest, Forbidden, RetryAfter) as exc:
+                        # Telegram explicitly rejected this request: nothing was delivered.
+                        with self.db() as db:
+                            db.execute("DELETE FROM daily_deliveries WHERE channel=? AND day=? AND path=? AND state='pending'",
+                                       (str(self.channel), day, path))
+                        log.error("Telegram rejected delivery (%s): %s; stopping this batch", type(exc).__name__, exc)
+                        return
                     except Exception:
                         log.exception("Delivery outcome uncertain; reserved track will not be retried: %s", path)
                     await asyncio.sleep(2)

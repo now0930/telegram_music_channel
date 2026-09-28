@@ -47,10 +47,12 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                 p = Path(tmp) / f"{i}.mp3"
                 p.write_bytes(b"test")
                 tracks.append((str(p), {"title": str(i)}))
-            bot = SimpleNamespace(send_audio=AsyncMock())
+            bot = SimpleNamespace(send_audio=AsyncMock(), get_chat=AsyncMock())
             context = SimpleNamespace(bot=bot)
             with patch.dict(os.environ, {"MUSIC_CHANNEL_ID": "-100123", "MUSIC_PATH": tmp}), \
-                 patch.dict(sys.modules, {"ollama": SimpleNamespace(Client=Mock())}), \
+                 patch.dict(sys.modules, {"ollama": SimpleNamespace(Client=Mock()),
+                     "telegram.error": SimpleNamespace(BadRequest=type("BadRequest", (Exception,), {}),
+                         Forbidden=type("Forbidden", (Exception,), {}), RetryAfter=type("RetryAfter", (Exception,), {}))}), \
                  patch.object(dm, "collect_context", return_value={"season": "가을"}), \
                  patch.object(dm, "choose_query", return_value="잔잔한 음악"), \
                  patch.object(dm.DailyMusic, "candidates", return_value=tracks), \
@@ -60,6 +62,16 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                 clock.now.return_value = datetime(2026, 9, 28, 5, 0)
                 def runner():
                     return dm.DailyMusic(None, None, str(Path(tmp)/"state.db"), "embed", "host")
+                bad_request = sys.modules["telegram.error"].BadRequest
+                bot.get_chat.side_effect = bad_request("Chat not found")
+                await runner().tick(context)
+                self.assertEqual(bot.send_audio.await_count, 0)
+                bot.get_chat.side_effect = None
+                bot.send_audio.side_effect = bad_request("Chat not found")
+                await runner().tick(context)
+                with runner().db() as db:
+                    self.assertEqual(db.execute("SELECT count(*) FROM daily_deliveries").fetchone()[0], 0)
+                bot.send_audio.reset_mock(side_effect=True)
                 await runner().tick(context)
                 self.assertEqual(bot.send_audio.await_count, 10)
                 await runner().tick(context)
