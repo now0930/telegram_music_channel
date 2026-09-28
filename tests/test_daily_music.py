@@ -75,7 +75,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                      "telegram.error": SimpleNamespace(BadRequest=type("BadRequest", (Exception,), {}),
                          Forbidden=type("Forbidden", (Exception,), {}), RetryAfter=type("RetryAfter", (Exception,), {}))}), \
                  patch.object(dm, "collect_context", return_value={"season": "가을"}), \
-                 patch.object(dm, "choose_query", return_value="잔잔한 음악"), \
+                 patch.object(dm.DailyMusic, "recommendation_query", new=AsyncMock(return_value=dm.fallback_intent("가을", "오전"))), \
                  patch.object(dm.DailyMusic, "candidates", return_value=tracks), \
                  patch.object(dm.asyncio, "sleep", new=AsyncMock()), \
                  patch.object(dm, "datetime") as clock:
