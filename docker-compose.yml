@@ -6,7 +6,7 @@ services:
     volumes:
       - /mnt/ExtSSD/MP3:/music:ro
       - ./app:/app
-      - ./music_vector_db:/app/music_vector_db
+      - ./music_vector_db:/app/vector_db
       - ./.env:/app/.env  # 호스트의 .env를 컨테이너의 /app/.env로 연결
     working_dir: /app
     # 컨테이너 시작 시 라이브러리 설치 후 실행

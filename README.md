@@ -59,7 +59,7 @@
 2. 기존 필터에서 사용한 Ollama 서버를 `OLLAMA_HOST`로 지정합니다.
    기본 모델은 `hf.co/sky7350/Mica-v0.1-4B:Q5_K_M`입니다.
    임베딩용 `mxbai-embed-large`도 같은 서버에 필요합니다.
-3. 색인 데이터는 저장소의 `music_vector_db`에, 음원은 `/mnt/ExtSSD/MP3`에 준비합니다.
+3. 색인 데이터는 저장소의 `app/music_vector_db`에, 음원은 `/mnt/ExtSSD/MP3`에 준비합니다.
    컨테이너에서 색인과 봇 모두 `/app/music_vector_db`, `/music`을 사용해야 합니다.
 4. `docker compose up -d`로 실행하고 `docker compose logs -f`로 확인합니다.
 
@@ -79,3 +79,7 @@ Mica는 [Ollama JSON 스키마 출력](https://ollama.com/blog/structured-output
 자동 추천 게시물은 기존 대화 응답의 TTL 삭제 대상에 넣지 않습니다.
 
 검증: `python3 -m unittest discover -s tests -v` (실제 채널 발송 없음).
+
+기존 운영 DB는 `app/music_vector_db`이며 `./app:/app` 마운트로 접근합니다.
+저장소 루트 `music_vector_db`는 기존처럼 `/app/vector_db`에 연결됩니다.
+이를 `/app/music_vector_db`에 마운트하면 실제 색인을 가릴 수 있으므로 변경하지 마세요.

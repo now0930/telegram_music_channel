@@ -116,6 +116,7 @@ class DailyMusic:
     def candidates(self, query):
         count = self.collection.count()
         if not count:
+            log.error("Music library is empty; check MUSIC_DB_PATH and Docker mounts")
             return []
         embedding = self.client.embeddings(model=self.embed_model, prompt=query).embedding
         result = self.collection.query(query_embeddings=[embedding], n_results=min(count, 200))

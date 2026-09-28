@@ -46,6 +46,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("music_bot")
 
 # ═════════════════════════════════════════════════════════════════════════════════════
@@ -97,9 +98,10 @@ try:
     _chroma = chromadb.PersistentClient(path=DB_PATH)
     collection = _chroma.get_or_create_collection(name="music_library")
 except ChromaInternalError as e:
-    logger.error("ChromaDB 컬렉션 로드 중 에러 발생. 재구성을 시도합니다: %s", e)
-    _chroma.delete_collection("music_library")
-    collection = _chroma.get_or_create_collection(name="music_library")
+    logger.exception("ChromaDB 로드 실패. 기존 음악 색인을 보존하고 종료합니다.")
+    raise
+
+logger.info("Music DB: %s (%d tracks)", os.path.abspath(DB_PATH), collection.count())
 
 # ═════════════════════════════════════════════════════════════════════════════════════
 #  🛠️ 유틸리티
