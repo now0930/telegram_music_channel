@@ -7,7 +7,7 @@ import re
 import sqlite3
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlencode, quote
 from urllib.request import Request, urlopen
@@ -122,6 +122,15 @@ class DailyMusic:
         self.schedule = parse_schedule()
         self.quotas = read_quotas()
         self.total = sum(self.quotas.values())
+        self.repeat_days = int(os.getenv("RECOMMEND_REPEAT_DAYS", "7"))
+        self.low_priority_max = int(os.getenv("RECOMMEND_LOW_PRIORITY_MAX", "1"))
+        self.music_root = Path(os.getenv("MUSIC_PATH", "/music")).resolve()
+        folder = Path(os.getenv("RECOMMEND_LOW_PRIORITY_DIRECTORY", "잡다한"))
+        if folder.is_absolute() or ".." in folder.parts or not folder.parts:
+            raise ValueError("Low priority directory must be a relative directory inside MUSIC_PATH")
+        self.low_priority_root = self.music_root / folder
+        if self.repeat_days < 0 or self.low_priority_max < 0:
+            raise ValueError("Repeat days and low priority maximum must be nonnegative")
         self.lock = asyncio.Lock()
         self.db_path = db_path
         with self.db() as db:
@@ -140,16 +149,28 @@ class DailyMusic:
     def delivery_progress(self, day, slot):
         """Pending sends count toward quotas to avoid ambiguous duplicate delivery."""
         with self.db() as db:
+            cutoff = (datetime.strptime(day, "%Y-%m-%d") - timedelta(days=self.repeat_days)).date().isoformat()
             rows = db.execute(
-                "SELECT path, slot FROM daily_deliveries WHERE channel=? AND day=?",
-                (str(self.channel), day),
+                "SELECT path, slot, day FROM daily_deliveries WHERE channel=? AND day>=? AND day<=?",
+                (str(self.channel), cutoff, day),
             ).fetchall()
-        used = {path for path, _ in rows}
+        used = {path for path, _, _ in rows}
         counts = {group: 0 for group in self.quotas}
-        for path, sent_slot in rows:
-            if sent_slot == slot:
+        for path, sent_slot, sent_day in rows:
+            if sent_day == day and sent_slot == slot:
                 counts[track_group(path)] += 1
         return used, counts
+
+    def is_low_priority(self, path):
+        return Path(path).is_relative_to(self.low_priority_root)
+
+    def low_priority_progress(self, day, slot):
+        with self.db() as db:
+            rows = db.execute(
+                "SELECT path FROM daily_deliveries WHERE channel=? AND day=? AND slot=?",
+                (str(self.channel), day, slot),
+            ).fetchall()
+        return sum(self.is_low_priority(path) for (path,) in rows)
 
     def log_delivery_status(self, day, slot):
         with self.db() as db:
@@ -218,6 +239,7 @@ class DailyMusic:
             slot = due[-1][0]
             day = now.date().isoformat()
             used, counts = self.delivery_progress(day, slot)
+            low_priority_count = self.low_priority_progress(day, slot)
             completed = sum(counts.values())
             if self.quota_reached(counts):
                 self.log_delivery_status(day, slot)
@@ -241,12 +263,16 @@ class DailyMusic:
                     group = track_group(path)
                     if counts[group] >= self.quotas[group]:
                         continue
+                    low_priority = self.is_low_priority(path)
+                    if low_priority and low_priority_count >= self.low_priority_max:
+                        continue
                     # Reserve before sending: ambiguous timeouts/crashes must not resend audio.
                     if not self.reserve_delivery(day, slot, path):
                         continue
                     used.add(path)
                     completed += 1
                     counts[group] += 1
+                    low_priority_count += int(low_priority)
                     try:
                         with open(path, "rb") as audio:
                             await context.bot.send_audio(chat_id=self.channel, audio=audio,
@@ -264,7 +290,7 @@ class DailyMusic:
                     await asyncio.sleep(2)
                 for group, quota in self.quotas.items():
                     if counts[group] < quota:
-                        log.warning("%s %s: %s only %d/%d tracks available; no cross-directory substitution",
+                        log.warning("%s %s: %s only %d/%d tracks available after history/folder limits; no cross-directory substitution",
                                     day, slot, group, counts[group], quota)
                 self.log_delivery_status(day, slot)
             except Exception:
